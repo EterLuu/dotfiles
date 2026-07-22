@@ -6,6 +6,21 @@ set -u
 PROGRAM=${0##*/}
 DRY_RUN=0
 BACKUP_DIR=""
+TRANSACTION_ACTIVE=0
+TRANSACTION_DIR=""
+TRANSACTION_ORIGINAL_HEAD=""
+TRANSACTION_HOME_LIST=""
+TRANSACTION_PUSHING=0
+TRANSACTION_BUILDING=0
+TRANSACTION_COMMITTED=0
+TRANSACTION_LOCK=""
+TRANSACTION_LOCK_HELD=0
+TRANSACTION_BACKUP_DIR=""
+TRANSACTION_CHECKPOINT=0
+TRANSACTION_EXPECTED_FILE=""
+SYNC_REMOTE=""
+SYNC_MERGE_REF=""
+SYNC_UPSTREAM_REF=""
 
 log() {
     printf '%s\n' "$*"
@@ -43,6 +58,7 @@ resolve_script_root() {
 : "${HOME:?HOME must be set}"
 XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-"$HOME/.config"}
 XDG_STATE_HOME=${XDG_STATE_HOME:-"$HOME/.local/state"}
+TRANSACTION_LOCK=$XDG_STATE_HOME/dotfiles/transaction.lock
 CONFIG_DIR=$XDG_CONFIG_HOME/dotfiles
 ROOT_HINT=$CONFIG_DIR/root
 DERIVED_ROOT=$(resolve_script_root)
@@ -294,7 +310,11 @@ backup_target() {
     target=$1
     relative=${target#"$HOME"/}
     if [ -z "$BACKUP_DIR" ]; then
-        BACKUP_DIR=$XDG_STATE_HOME/dotfiles/backups/$(date +%Y%m%d-%H%M%S)-$$
+        if [ "$TRANSACTION_ACTIVE" -eq 1 ] && [ -n "$TRANSACTION_BACKUP_DIR" ]; then
+            BACKUP_DIR=$TRANSACTION_BACKUP_DIR
+        else
+            BACKUP_DIR=$XDG_STATE_HOME/dotfiles/backups/$(date +%Y%m%d-%H%M%S)-$$
+        fi
     fi
     backup_target=$BACKUP_DIR/$relative
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -375,7 +395,11 @@ install_all() {
     if [ -n "$BACKUP_DIR" ]; then
         log "Backup directory: $BACKUP_DIR"
     fi
-    log "Done. Start a new shell or run: exec \"${SHELL:-zsh}\" -l"
+    if [ "$TRANSACTION_ACTIVE" -eq 1 ]; then
+        log "Deployment validated; waiting for transaction commit."
+    else
+        log "Done. Start a new shell or run: exec \"${SHELL:-zsh}\" -l"
+    fi
 }
 
 status_all() {
@@ -389,7 +413,10 @@ status_all() {
         validate_relative_path "$target_rel"
         source_path=$ROOT/$source_rel
         target_path=$HOME/$target_rel
-        if [ "$mode" = link ] && [ -L "$target_path" ]; then
+        if [ ! -e "$source_path" ]; then
+            printf '[source-missing] %s <- %s\n' "$target_rel" "$source_rel"
+            failures=$((failures + 1))
+        elif [ "$mode" = link ] && [ -L "$target_path" ]; then
             current_link=$(readlink "$target_path" 2>/dev/null || true)
             if [ "$current_link" = "$source_path" ]; then
                 printf '[ok]      %s\n' "$target_rel"
@@ -524,24 +551,707 @@ check_staged_secrets() {
     [ -z "$suspicious" ] || die "refusing to commit a possible secret: $suspicious"
 }
 
+managed_repository_path() {
+    case "$1" in
+        .dotfiles-manifest|.gitattributes|.gitignore|README.md) return 0 ;;
+        bin|bin/*|dotfiles|dotfiles/*|examples|examples/*|profiles|profiles/*|tests|tests/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+check_repository_scope() {
+    local changed_list changed_path outside_path
+    changed_list=$XDG_STATE_HOME/dotfiles/preflight-files.$$
+    mkdir -p "$(dirname "$changed_list")" || die "cannot create dotfiles state directory"
+    {
+        git -C "$ROOT" diff --name-only --no-renames
+        git -C "$ROOT" ls-files --others --exclude-standard
+    } > "$changed_list" || die "cannot inspect repository changes"
+    outside_path=""
+    while IFS= read -r changed_path; do
+        [ -n "$changed_path" ] || continue
+        if ! managed_repository_path "$changed_path"; then
+            outside_path=$changed_path
+            break
+        fi
+    done < "$changed_list"
+    rm "$changed_list" || true
+    [ -z "$outside_path" ] || die "uncommitted path is outside the dotfiles transaction: $outside_path"
+}
+
+transaction_repository_paths() {
+    printf '%s\n' \
+        .dotfiles-manifest .gitattributes .gitignore README.md \
+        bin dotfiles examples profiles tests
+}
+
+find_pending_transactions() {
+    local transaction_base candidate
+    transaction_base=$XDG_STATE_HOME/dotfiles/transactions
+    for candidate in "$transaction_base"/*; do
+        if [ -f "$candidate/ACTIVE" ] || [ -f "$candidate/IN_DOUBT" ]; then
+            printf '%s\n' "$candidate"
+        fi
+    done
+}
+
+assert_no_pending_transaction() {
+    local pending
+    pending=$(find_pending_transactions | sed -n '1p')
+    [ -z "$pending" ] \
+        || die "an unresolved dotfiles transaction exists; run 'dotfiles recover': $pending"
+}
+
+path_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
+fingerprint_path() {
+    local path label mode checksum link_target
+    path=$1
+    label=$2
+    if [ -L "$path" ]; then
+        mode=$(path_mode "$path") || return 1
+        link_target=$(readlink "$path") || return 1
+        printf 'L|%s|%s|%s\n' "$label" "$mode" "$link_target"
+    elif [ -f "$path" ]; then
+        mode=$(path_mode "$path") || return 1
+        checksum=$(cksum < "$path") || return 1
+        printf 'F|%s|%s|%s\n' "$label" "$mode" "$checksum"
+    elif [ -d "$path" ]; then
+        mode=$(path_mode "$path") || return 1
+        printf 'D|%s|%s\n' "$label" "$mode"
+    elif [ -e "$path" ]; then
+        mode=$(path_mode "$path") || return 1
+        printf 'O|%s|%s\n' "$label" "$mode"
+    else
+        printf 'A|%s\n' "$label"
+    fi
+}
+
+fingerprint_tree() {
+    local tree_path label path_list item relative
+    tree_path=$1
+    label=$2
+    fingerprint_path "$tree_path" "$label" || return 1
+    if [ ! -d "$tree_path" ] || [ -L "$tree_path" ]; then
+        return 0
+    fi
+    path_list=$TRANSACTION_DIR/fingerprint-paths.$$
+    find "$tree_path" -mindepth 1 -print | LC_ALL=C sort > "$path_list" || return 1
+    while IFS= read -r item; do
+        relative=${item#"$tree_path"/}
+        fingerprint_path "$item" "$label/$relative" || {
+            rm -f "$path_list"
+            return 1
+        }
+    done < "$path_list"
+    rm -f "$path_list" || return 1
+}
+
+write_transaction_fingerprint() {
+    local managed_path scope source_rel target_rel target_path
+    local presence original_mode directory_path
+    printf 'HEAD|%s\n' "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf unknown)"
+    printf '%s\n' 'GIT-STATUS-BEGIN'
+    git -C "$ROOT" status --porcelain=v1 --untracked-files=all || return 1
+    printf '%s\n' 'GIT-STATUS-END' 'GIT-INDEX-DIFF-BEGIN'
+    git -C "$ROOT" diff --cached --binary --no-ext-diff || return 1
+    printf '%s\n' 'GIT-INDEX-DIFF-END'
+
+    for managed_path in $(transaction_repository_paths); do
+        fingerprint_tree "$ROOT/$managed_path" "repository/$managed_path" || return 1
+    done
+    while IFS='|' read -r scope source_rel target_rel; do
+        case "$scope" in ""|\#*) continue ;; esac
+        scope_applies "$scope" || continue
+        validate_relative_path "$target_rel"
+        target_path=$HOME/$target_rel
+        fingerprint_path "$target_path" "home/$target_rel" || return 1
+    done < "$MANIFEST"
+
+    fingerprint_path "$ROOT_HINT" root-hint || return 1
+    fingerprint_path "$CONFIG_DIR/generated.sh" generated-env || return 1
+    fingerprint_path "$CONFIG_DIR/local.zsh" local-zsh || return 1
+    fingerprint_path "$CONFIG_DIR/local.bash" local-bash || return 1
+    fingerprint_path "$CONFIG_DIR/local.profile" local-profile || return 1
+    fingerprint_path "$XDG_CONFIG_HOME/git/local.conf" git-local || return 1
+    fingerprint_path "$HOME/.ssh/config.local" ssh-local || return 1
+    fingerprint_tree "$XDG_STATE_HOME/dotfiles/copy-base" copy-base || return 1
+    fingerprint_tree "$TRANSACTION_BACKUP_DIR" transaction-backup || return 1
+
+    if [ -f "$TRANSACTION_DIR/dirs.list" ]; then
+        while IFS='|' read -r presence original_mode directory_path; do
+            [ -n "$directory_path" ] || continue
+            fingerprint_path "$directory_path" "directory/$directory_path" || return 1
+        done < "$TRANSACTION_DIR/dirs.list"
+    fi
+}
+
+checkpoint_transaction_state() {
+    local fingerprint_tmp marker_tmp local_head
+    TRANSACTION_CHECKPOINT=$((TRANSACTION_CHECKPOINT + 1))
+    TRANSACTION_EXPECTED_FILE=expected-$TRANSACTION_CHECKPOINT.fingerprint
+    fingerprint_tmp=$TRANSACTION_DIR/$TRANSACTION_EXPECTED_FILE.tmp.$$
+    write_transaction_fingerprint > "$fingerprint_tmp" \
+        || die "cannot fingerprint transaction state"
+    mv "$fingerprint_tmp" "$TRANSACTION_DIR/$TRANSACTION_EXPECTED_FILE" \
+        || die "cannot activate transaction fingerprint"
+    local_head=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf unknown)
+    marker_tmp=$TRANSACTION_DIR/ACTIVE.tmp.$$
+    {
+        printf 'status=active\n'
+        printf 'local_head=%s\n' "$local_head"
+        printf 'original_head=%s\n' "$TRANSACTION_ORIGINAL_HEAD"
+        printf 'repository=%s\n' "$ROOT"
+        printf 'backup_dir=%s\n' "$TRANSACTION_BACKUP_DIR"
+        printf 'fingerprint=%s\n' "$TRANSACTION_EXPECTED_FILE"
+    } > "$marker_tmp" || die "cannot write active transaction marker"
+    mv "$marker_tmp" "$TRANSACTION_DIR/ACTIVE" \
+        || die "cannot activate transaction checkpoint"
+}
+
+transaction_state_matches_checkpoint() {
+    local current_fingerprint expected_path
+    case "$TRANSACTION_EXPECTED_FILE" in
+        */*) return 1 ;;
+        expected-[0-9]*.fingerprint) ;;
+        *) return 1 ;;
+    esac
+    expected_path=$TRANSACTION_DIR/$TRANSACTION_EXPECTED_FILE
+    [ -f "$expected_path" ] || return 1
+    current_fingerprint=$TRANSACTION_DIR/current-fingerprint.$$
+    if ! write_transaction_fingerprint > "$current_fingerprint"; then
+        rm -f "$current_fingerprint"
+        return 1
+    fi
+    if cmp -s "$expected_path" "$current_fingerprint"; then
+        rm -f "$current_fingerprint"
+        return 0
+    fi
+    rm -f "$current_fingerprint"
+    return 1
+}
+
+acquire_transaction_lock() {
+    local allow_stale owner_pid
+    allow_stale=${1:-0}
+    mkdir -p "$(dirname "$TRANSACTION_LOCK")" || die "cannot create dotfiles state directory"
+    if ! mkdir "$TRANSACTION_LOCK" 2>/dev/null; then
+        owner_pid=$(sed -n 's/^pid=//p' "$TRANSACTION_LOCK/owner" 2>/dev/null || true)
+        if [ -n "$owner_pid" ] && kill -0 "$owner_pid" 2>/dev/null; then
+            die "another dotfiles transaction may be running (pid $owner_pid); lock: $TRANSACTION_LOCK"
+        fi
+        if [ "$allow_stale" -eq 1 ]; then
+            rm -rf "$TRANSACTION_LOCK" || die "cannot remove stale transaction lock: $TRANSACTION_LOCK"
+            mkdir "$TRANSACTION_LOCK" || die "cannot acquire transaction lock after stale recovery"
+        else
+            die "stale dotfiles transaction lock exists; run 'dotfiles recover': $TRANSACTION_LOCK"
+        fi
+    fi
+    {
+        printf 'pid=%s\n' "$$"
+        printf 'repository=%s\n' "$ROOT"
+    } > "$TRANSACTION_LOCK/owner" || {
+        rmdir "$TRANSACTION_LOCK" 2>/dev/null || true
+        die "cannot write transaction lock"
+    }
+    TRANSACTION_LOCK_HELD=1
+    trap 'transaction_exit_handler $?' EXIT
+    trap 'exit 130' HUP INT TERM
+}
+
+release_transaction_lock() {
+    if [ "$TRANSACTION_LOCK_HELD" -eq 1 ]; then
+        rm -rf "$TRANSACTION_LOCK" || warn "could not remove transaction lock: $TRANSACTION_LOCK"
+        TRANSACTION_LOCK_HELD=0
+    fi
+}
+
+finish_locked_mutation() {
+    trap - EXIT HUP INT TERM
+    release_transaction_lock
+}
+
+snapshot_transaction_state_file() {
+    local state_path state_name
+    state_path=$1
+    state_name=$2
+    if [ -e "$state_path" ] || [ -L "$state_path" ]; then
+        printf 'P|%s|%s\n' "$state_name" "$state_path" >> "$TRANSACTION_DIR/state.list"
+        cp -Pp "$state_path" "$TRANSACTION_DIR/state/$state_name" \
+            || die "cannot snapshot transaction state: $state_path"
+    else
+        printf 'A|%s|%s\n' "$state_name" "$state_path" >> "$TRANSACTION_DIR/state.list"
+    fi
+}
+
+snapshot_transaction_directory() {
+    local directory_path presence original_mode recorded_presence recorded_mode recorded_path
+    directory_path=$1
+    while IFS='|' read -r recorded_presence recorded_mode recorded_path; do
+        [ "$recorded_path" = "$directory_path" ] && return 0
+    done < "$TRANSACTION_DIR/dirs.list"
+
+    if [ -d "$directory_path" ]; then
+        presence=P
+        original_mode=$(path_mode "$directory_path") \
+            || die "cannot read directory mode for transaction: $directory_path"
+    elif [ -e "$directory_path" ] || [ -L "$directory_path" ]; then
+        presence=O
+        original_mode=-
+    else
+        presence=A
+        original_mode=-
+    fi
+    printf '%s|%s|%s\n' "$presence" "$original_mode" "$directory_path" \
+        >> "$TRANSACTION_DIR/dirs.list" \
+        || die "cannot snapshot transaction directory: $directory_path"
+}
+
+snapshot_transaction_directory_chain() {
+    local directory_path boundary parent
+    directory_path=$1
+    boundary=$2
+    [ "$directory_path" = "$boundary" ] && return 0
+    case "$directory_path" in
+        "$boundary"/*) ;;
+        *) snapshot_transaction_directory "$directory_path"; return 0 ;;
+    esac
+    parent=$(dirname "$directory_path")
+    [ "$parent" = "$directory_path" ] || \
+        snapshot_transaction_directory_chain "$parent" "$boundary"
+    snapshot_transaction_directory "$directory_path"
+}
+
+snapshot_transaction_directories() {
+    local scope source_rel target_rel target_directory
+    snapshot_transaction_directory_chain "$XDG_CONFIG_HOME" "$HOME"
+    snapshot_transaction_directory_chain "$CONFIG_DIR" "$HOME"
+    snapshot_transaction_directory_chain "$XDG_CONFIG_HOME/git" "$HOME"
+    snapshot_transaction_directory_chain "$HOME/.ssh" "$HOME"
+    snapshot_transaction_directory_chain "$HOME/.ssh/config.d" "$HOME"
+    snapshot_transaction_directory_chain "$XDG_STATE_HOME/zsh" "$XDG_STATE_HOME"
+    snapshot_transaction_directory_chain "$XDG_STATE_HOME/vim" "$XDG_STATE_HOME"
+    snapshot_transaction_directory_chain "$XDG_STATE_HOME/vim/backup" "$XDG_STATE_HOME"
+    snapshot_transaction_directory_chain "$XDG_STATE_HOME/vim/swap" "$XDG_STATE_HOME"
+    snapshot_transaction_directory_chain "$XDG_STATE_HOME/vim/undo" "$XDG_STATE_HOME"
+    while IFS='|' read -r scope source_rel target_rel; do
+        case "$scope" in ""|\#*) continue ;; esac
+        scope_applies "$scope" || continue
+        validate_relative_path "$target_rel"
+        target_directory=$(dirname "$HOME/$target_rel")
+        snapshot_transaction_directory_chain "$target_directory" "$HOME"
+    done < "$MANIFEST"
+}
+
+begin_transaction() {
+    local transaction_base managed_path base_dir
+    TRANSACTION_ORIGINAL_HEAD=$(git -C "$ROOT" rev-parse --verify HEAD 2>/dev/null) \
+        || die "transaction requires a repository with at least one commit"
+    transaction_base=$XDG_STATE_HOME/dotfiles/transactions
+    TRANSACTION_DIR=$transaction_base/$(date +%Y%m%d-%H%M%S)-$$
+    TRANSACTION_BACKUP_DIR=$XDG_STATE_HOME/dotfiles/backups/transaction-$(basename "$TRANSACTION_DIR")
+    TRANSACTION_BUILDING=1
+    mkdir -p "$TRANSACTION_DIR/repository" "$TRANSACTION_DIR/state" \
+        || die "cannot create transaction snapshot: $TRANSACTION_DIR"
+    chmod 700 "$TRANSACTION_DIR" 2>/dev/null || true
+
+    for managed_path in $(transaction_repository_paths); do
+        if [ -e "$ROOT/$managed_path" ] || [ -L "$ROOT/$managed_path" ]; then
+            mkdir -p "$(dirname "$TRANSACTION_DIR/repository/$managed_path")" \
+                || die "cannot prepare repository snapshot"
+            cp -Rp "$ROOT/$managed_path" "$TRANSACTION_DIR/repository/$managed_path" \
+                || die "cannot snapshot repository path: $managed_path"
+        fi
+    done
+
+    : > "$TRANSACTION_DIR/state.list"
+    : > "$TRANSACTION_DIR/dirs.list"
+    snapshot_transaction_state_file "$ROOT_HINT" root-hint
+    snapshot_transaction_state_file "$CONFIG_DIR/generated.sh" generated-env
+    snapshot_transaction_state_file "$CONFIG_DIR/local.zsh" local-zsh
+    snapshot_transaction_state_file "$CONFIG_DIR/local.bash" local-bash
+    snapshot_transaction_state_file "$CONFIG_DIR/local.profile" local-profile
+    snapshot_transaction_state_file "$XDG_CONFIG_HOME/git/local.conf" git-local
+    snapshot_transaction_state_file "$HOME/.ssh/config.local" ssh-local
+
+    base_dir=$XDG_STATE_HOME/dotfiles/copy-base
+    if [ -e "$base_dir" ]; then
+        printf 'P\n' > "$TRANSACTION_DIR/copy-base.status"
+        cp -Rp "$base_dir" "$TRANSACTION_DIR/copy-base" \
+            || die "cannot snapshot copy baselines"
+    else
+        printf 'A\n' > "$TRANSACTION_DIR/copy-base.status"
+    fi
+
+    TRANSACTION_HOME_LIST=$TRANSACTION_DIR/home.list
+    snapshot_transaction_directories
+    checkpoint_transaction_state
+    TRANSACTION_BUILDING=0
+    TRANSACTION_ACTIVE=1
+}
+
+snapshot_transaction_home() {
+    local scope source_rel target_rel target_path snapshot_path
+    mkdir -p "$TRANSACTION_DIR/home" || die "cannot prepare HOME snapshot"
+    : > "$TRANSACTION_HOME_LIST"
+    while IFS='|' read -r scope source_rel target_rel; do
+        case "$scope" in ""|\#*) continue ;; esac
+        scope_applies "$scope" || continue
+        validate_relative_path "$target_rel"
+        target_path=$HOME/$target_rel
+        snapshot_path=$TRANSACTION_DIR/home/$target_rel
+        if [ -e "$target_path" ] || [ -L "$target_path" ]; then
+            printf 'P|%s\n' "$target_rel" >> "$TRANSACTION_HOME_LIST"
+            mkdir -p "$(dirname "$snapshot_path")" || die "cannot prepare HOME snapshot path"
+            cp -Rp "$target_path" "$snapshot_path" || die "cannot snapshot HOME target: $target_rel"
+        else
+            printf 'A|%s\n' "$target_rel" >> "$TRANSACTION_HOME_LIST"
+        fi
+    done < "$MANIFEST"
+}
+
+restore_transaction_repository() {
+    local managed_path failed
+    failed=0
+    git -C "$ROOT" rebase --abort >/dev/null 2>&1 || true
+    if ! git -C "$ROOT" reset --hard "$TRANSACTION_ORIGINAL_HEAD" >/dev/null 2>&1; then
+        warn "could not reset Git HEAD to $TRANSACTION_ORIGINAL_HEAD"
+        return 1
+    fi
+    for managed_path in $(transaction_repository_paths); do
+        if [ -e "$ROOT/$managed_path" ] || [ -L "$ROOT/$managed_path" ]; then
+            rm -rf "$ROOT/$managed_path" || failed=1
+        fi
+        if [ -e "$TRANSACTION_DIR/repository/$managed_path" ] || \
+           [ -L "$TRANSACTION_DIR/repository/$managed_path" ]; then
+            mkdir -p "$(dirname "$ROOT/$managed_path")" || failed=1
+            cp -Rp "$TRANSACTION_DIR/repository/$managed_path" "$ROOT/$managed_path" || failed=1
+        fi
+    done
+    return "$failed"
+}
+
+restore_transaction_home() {
+    local presence target_rel target_path snapshot_path failed
+    failed=0
+    [ -f "$TRANSACTION_HOME_LIST" ] || return 0
+    while IFS='|' read -r presence target_rel; do
+        [ -n "$target_rel" ] || continue
+        validate_relative_path "$target_rel"
+        target_path=$HOME/$target_rel
+        snapshot_path=$TRANSACTION_DIR/home/$target_rel
+        if [ -e "$target_path" ] || [ -L "$target_path" ]; then
+            rm -rf "$target_path" || failed=1
+        fi
+        if [ "$presence" = P ]; then
+            mkdir -p "$(dirname "$target_path")" || failed=1
+            cp -Rp "$snapshot_path" "$target_path" || failed=1
+        fi
+    done < "$TRANSACTION_HOME_LIST"
+    return "$failed"
+}
+
+restore_transaction_state() {
+    local presence state_name state_path snapshot_path base_dir base_status failed
+    failed=0
+    if [ -f "$TRANSACTION_DIR/state.list" ]; then
+        while IFS='|' read -r presence state_name state_path; do
+            [ -n "$state_path" ] || continue
+            snapshot_path=$TRANSACTION_DIR/state/$state_name
+            if [ -e "$state_path" ] || [ -L "$state_path" ]; then
+                rm -f "$state_path" || failed=1
+            fi
+            if [ "$presence" = P ]; then
+                mkdir -p "$(dirname "$state_path")" || failed=1
+                cp -Pp "$snapshot_path" "$state_path" || failed=1
+            fi
+        done < "$TRANSACTION_DIR/state.list"
+    fi
+
+    base_dir=$XDG_STATE_HOME/dotfiles/copy-base
+    base_status=$(sed -n '1p' "$TRANSACTION_DIR/copy-base.status" 2>/dev/null || printf A)
+    if [ -e "$base_dir" ]; then
+        rm -rf "$base_dir" || failed=1
+    fi
+    if [ "$base_status" = P ]; then
+        mkdir -p "$(dirname "$base_dir")" || failed=1
+        cp -Rp "$TRANSACTION_DIR/copy-base" "$base_dir" || failed=1
+    fi
+    return "$failed"
+}
+
+restore_transaction_directories() {
+    local reversed_list presence original_mode directory_path failed
+    failed=0
+    [ -f "$TRANSACTION_DIR/dirs.list" ] || return 0
+    reversed_list=$TRANSACTION_DIR/dirs-reversed.$$
+    awk '{ line[NR]=$0 } END { for (i=NR; i>=1; i--) print line[i] }' \
+        "$TRANSACTION_DIR/dirs.list" > "$reversed_list" || return 1
+    while IFS='|' read -r presence original_mode directory_path; do
+        [ -n "$directory_path" ] || continue
+        case "$presence" in
+            P)
+                if [ ! -d "$directory_path" ]; then
+                    if [ -e "$directory_path" ] || [ -L "$directory_path" ]; then
+                        warn "cannot restore directory replaced by another path: $directory_path"
+                        failed=1
+                        continue
+                    fi
+                    mkdir -p "$directory_path" || {
+                        failed=1
+                        continue
+                    }
+                fi
+                chmod "$original_mode" "$directory_path" 2>/dev/null || failed=1
+                ;;
+            A)
+                if [ -d "$directory_path" ] && [ ! -L "$directory_path" ]; then
+                    if ! rmdir "$directory_path" 2>/dev/null; then
+                        warn "preserved non-empty directory created during transaction: $directory_path"
+                        failed=1
+                    fi
+                elif [ -e "$directory_path" ] || [ -L "$directory_path" ]; then
+                    warn "preserved unexpected path created during transaction: $directory_path"
+                    failed=1
+                fi
+                ;;
+            O) ;;
+            *) failed=1 ;;
+        esac
+    done < "$reversed_list"
+    rm -f "$reversed_list" || failed=1
+    return "$failed"
+}
+
+rollback_transaction() {
+    local failed
+    TRANSACTION_ACTIVE=0
+    failed=0
+    warn "dotfiles transaction failed; restoring repository and HOME"
+    restore_transaction_repository || failed=1
+    restore_transaction_home || failed=1
+    restore_transaction_state || failed=1
+    restore_transaction_directories || failed=1
+    if [ -n "$BACKUP_DIR" ]; then
+        case "$BACKUP_DIR" in
+            "$XDG_STATE_HOME/dotfiles/backups/"*) rm -rf "$BACKUP_DIR" || failed=1 ;;
+            *) warn "refusing to remove unexpected backup path: $BACKUP_DIR"; failed=1 ;;
+        esac
+    fi
+    if [ "$failed" -eq 0 ]; then
+        rm -rf "$TRANSACTION_DIR" || failed=1
+    fi
+    if [ "$failed" -eq 0 ]; then
+        warn "rollback completed successfully"
+        return 0
+    fi
+    warn "rollback was incomplete; recovery snapshot retained at $TRANSACTION_DIR"
+    return 1
+}
+
+transaction_exit_handler() {
+    local exit_status
+    exit_status=$1
+    trap - EXIT HUP INT TERM
+    if [ "$TRANSACTION_COMMITTED" -eq 1 ]; then
+        rm -rf "$TRANSACTION_DIR" || exit_status=1
+    elif [ "$TRANSACTION_ACTIVE" -eq 1 ]; then
+        if [ "$TRANSACTION_PUSHING" -eq 1 ]; then
+            leave_transaction_in_doubt
+        else
+            rollback_transaction || exit_status=1
+        fi
+    elif [ "$TRANSACTION_BUILDING" -eq 1 ] && [ -n "$TRANSACTION_DIR" ]; then
+        rm -rf "$TRANSACTION_DIR" || exit_status=1
+    fi
+    release_transaction_lock
+    exit "$exit_status"
+}
+
+finish_transaction() {
+    TRANSACTION_COMMITTED=1
+    TRANSACTION_ACTIVE=0
+    {
+        printf 'status=committed\n'
+        printf 'repository=%s\n' "$ROOT"
+    } > "$TRANSACTION_DIR/COMMITTED" 2>/dev/null || true
+    rm -f "$TRANSACTION_DIR/ACTIVE" "$TRANSACTION_DIR/IN_DOUBT" 2>/dev/null || true
+    trap - EXIT HUP INT TERM
+    if ! rm -rf "$TRANSACTION_DIR"; then
+        warn "transaction succeeded but snapshot cleanup failed: $TRANSACTION_DIR"
+    fi
+    release_transaction_lock
+}
+
+mark_transaction_in_doubt() {
+    local local_head marker_tmp
+    [ -n "$TRANSACTION_EXPECTED_FILE" ] \
+        || die "cannot mark a transaction in doubt without a verified checkpoint"
+    local_head=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf unknown)
+    marker_tmp=$TRANSACTION_DIR/IN_DOUBT.tmp.$$
+    {
+        printf 'status=in-doubt\n'
+        printf 'local_head=%s\n' "$local_head"
+        printf 'remote=%s\n' "$SYNC_REMOTE"
+        printf 'remote_ref=%s\n' "$SYNC_MERGE_REF"
+        printf 'original_head=%s\n' "$TRANSACTION_ORIGINAL_HEAD"
+        printf 'repository=%s\n' "$ROOT"
+        printf 'backup_dir=%s\n' "$TRANSACTION_BACKUP_DIR"
+        printf 'fingerprint=%s\n' "$TRANSACTION_EXPECTED_FILE"
+    } > "$marker_tmp" || die "cannot write uncertain transaction marker"
+    mv "$marker_tmp" "$TRANSACTION_DIR/IN_DOUBT" \
+        || die "cannot activate uncertain transaction marker"
+    rm -f "$TRANSACTION_DIR/ACTIVE" || true
+}
+
+leave_transaction_in_doubt() {
+    mark_transaction_in_doubt
+    TRANSACTION_ACTIVE=0
+    trap - EXIT HUP INT TERM
+    warn "push failed and the remote state could not be confirmed; automatic rollback would be unsafe"
+    warn "the committed/deployed local state and recovery snapshot were retained"
+    warn "transaction snapshot: $TRANSACTION_DIR"
+    warn "verify with: git ls-remote $SYNC_REMOTE $SYNC_MERGE_REF"
+    warn "save, sync, and update remain blocked until recovery completes"
+    # Keep a stale lock as a durable guard. recover is the only command allowed
+    # to replace it after this process exits.
+    {
+        printf 'status=in-doubt\n'
+        printf 'repository=%s\n' "$ROOT"
+        printf 'transaction=%s\n' "$TRANSACTION_DIR"
+    } > "$TRANSACTION_LOCK/owner" 2>/dev/null \
+        || warn "could not mark the transaction lock as unresolved"
+    TRANSACTION_LOCK_HELD=0
+}
+
+recover_transaction() {
+    local requested_dir transaction_base candidate marker_file marker_status
+    local recorded_root local_head remote_head candidate_count relative_candidate expected_backup_dir
+    requested_dir=${1:-}
+    acquire_transaction_lock 1
+    transaction_base=$XDG_STATE_HOME/dotfiles/transactions
+    if [ -n "$requested_dir" ]; then
+        TRANSACTION_DIR=$requested_dir
+        case "$TRANSACTION_DIR" in
+            "$transaction_base"/*)
+                relative_candidate=${TRANSACTION_DIR#"$transaction_base"/}
+                case "$relative_candidate" in */*) die "transaction path must be a direct child of $transaction_base" ;; esac
+                ;;
+            *) die "transaction path must be inside $transaction_base" ;;
+        esac
+    else
+        TRANSACTION_DIR=""
+        candidate_count=0
+        for candidate in "$transaction_base"/*; do
+            if [ ! -f "$candidate/IN_DOUBT" ] && [ ! -f "$candidate/ACTIVE" ]; then
+                continue
+            fi
+            TRANSACTION_DIR=$candidate
+            candidate_count=$((candidate_count + 1))
+        done
+        [ "$candidate_count" -le 1 ] \
+            || die "multiple recoverable transactions exist; specify one transaction directory explicitly"
+    fi
+    [ -n "$TRANSACTION_DIR" ] || die "no recoverable dotfiles transaction was found"
+    if [ -f "$TRANSACTION_DIR/IN_DOUBT" ]; then
+        marker_file=$TRANSACTION_DIR/IN_DOUBT
+    elif [ -f "$TRANSACTION_DIR/ACTIVE" ]; then
+        marker_file=$TRANSACTION_DIR/ACTIVE
+    else
+        die "not a recoverable transaction: $TRANSACTION_DIR"
+    fi
+    marker_status=$(sed -n 's/^status=//p' "$marker_file")
+
+    local_head=$(sed -n 's/^local_head=//p' "$marker_file")
+    SYNC_REMOTE=$(sed -n 's/^remote=//p' "$marker_file")
+    SYNC_MERGE_REF=$(sed -n 's/^remote_ref=//p' "$marker_file")
+    TRANSACTION_ORIGINAL_HEAD=$(sed -n 's/^original_head=//p' "$marker_file")
+    recorded_root=$(sed -n 's/^repository=//p' "$marker_file")
+    TRANSACTION_BACKUP_DIR=$(sed -n 's/^backup_dir=//p' "$marker_file")
+    TRANSACTION_EXPECTED_FILE=$(sed -n 's/^fingerprint=//p' "$marker_file")
+    BACKUP_DIR=$TRANSACTION_BACKUP_DIR
+    TRANSACTION_HOME_LIST=$TRANSACTION_DIR/home.list
+
+    [ "$recorded_root" = "$ROOT" ] || die "transaction belongs to another repository: $recorded_root"
+    expected_backup_dir=$XDG_STATE_HOME/dotfiles/backups/transaction-$(basename "$TRANSACTION_DIR")
+    [ "$TRANSACTION_BACKUP_DIR" = "$expected_backup_dir" ] \
+        || die "transaction contains an invalid backup path: $TRANSACTION_BACKUP_DIR"
+    if [ "$marker_status" = active ]; then
+        transaction_state_matches_checkpoint \
+            || die "managed state changed after the interruption; refusing automatic rollback: $TRANSACTION_DIR"
+        rollback_transaction || die "interrupted transaction rollback was incomplete"
+        log "Interrupted local transaction was rolled back."
+        release_transaction_lock
+        trap - EXIT HUP INT TERM
+        return
+    fi
+    [ "$marker_status" = in-doubt ] || die "unknown transaction marker status: $marker_status"
+    [ -n "$local_head" ] && git -C "$ROOT" cat-file -e "$local_head^{commit}" 2>/dev/null \
+        || die "recorded transaction commit is not available locally: $local_head"
+    if ! git -C "$ROOT" fetch "$SYNC_REMOTE" "$SYNC_MERGE_REF" >/dev/null 2>&1; then
+        die "remote is still unreachable; transaction remains in doubt at $TRANSACTION_DIR"
+    fi
+    remote_head=$(git -C "$ROOT" rev-parse FETCH_HEAD 2>/dev/null || true)
+    [ -n "$remote_head" ] || die "cannot resolve the remote branch; transaction remains in doubt"
+
+    if [ "$remote_head" = "$local_head" ] || \
+       git -C "$ROOT" merge-base --is-ancestor "$local_head" "$remote_head"; then
+        rm -rf "$TRANSACTION_DIR" || die "remote committed, but snapshot cleanup failed: $TRANSACTION_DIR"
+        log "Remote contains the transaction commit; local state was kept and recovery is complete."
+    else
+        transaction_state_matches_checkpoint \
+            || die "remote lacks the commit, but managed state changed after the uncertain push; refusing automatic rollback: $TRANSACTION_DIR"
+        rollback_transaction || die "automatic recovery rollback was incomplete"
+        log "Remote does not contain the transaction commit; local state was rolled back."
+    fi
+    release_transaction_lock
+    trap - EXIT HUP INT TERM
+}
+
+prepare_remote_sync() {
+    local branch_name
+    branch_name=$(git -C "$ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null) \
+        || die "the operation requires a checked-out branch"
+    SYNC_REMOTE=$(git -C "$ROOT" config --get "branch.$branch_name.remote" 2>/dev/null || true)
+    SYNC_MERGE_REF=$(git -C "$ROOT" config --get "branch.$branch_name.merge" 2>/dev/null || true)
+    [ -n "$SYNC_REMOTE" ] && [ "$SYNC_REMOTE" != . ] \
+        || die "the operation requires an upstream remote; configure it with git push -u"
+    [ -n "$SYNC_MERGE_REF" ] || die "the operation requires an upstream branch; configure it with git push -u"
+    git -C "$ROOT" fetch "$SYNC_REMOTE" || die "git fetch failed before transaction; nothing was changed locally"
+    SYNC_UPSTREAM_REF=$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+    [ -n "$SYNC_UPSTREAM_REF" ] || die "cannot resolve the configured upstream branch"
+}
+
 save_repository() {
-    local mode message push_changes committed
+    local mode message push_changes committed new_head remote_head push_confirmed
     mode=$1
     message=$2
     push_changes=$3
     committed=0
+    push_confirmed=0
 
     command -v git >/dev/null 2>&1 || die "git is required for save"
     git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$ROOT is not a Git worktree"
     git -C "$ROOT" diff --cached --quiet || die "repository already has staged changes; commit or unstage them first"
+    acquire_transaction_lock
+    assert_no_pending_transaction
+    check_repository_scope
+    if [ "$push_changes" -eq 1 ]; then
+        prepare_remote_sync
+    fi
+    begin_transaction
 
     if [ "$mode" = copy ]; then
         capture_copy_changes
+        checkpoint_transaction_state
     fi
 
     git -C "$ROOT" add -A -- \
         .dotfiles-manifest .gitattributes .gitignore README.md \
         bin dotfiles examples profiles tests || die "git add failed"
+    checkpoint_transaction_state
 
     if ! git -C "$ROOT" diff --cached --quiet; then
         git -C "$ROOT" diff --cached --check || die "staged changes contain whitespace errors"
@@ -555,20 +1265,55 @@ save_repository() {
     else
         log "No dotfiles changes to commit."
     fi
+    checkpoint_transaction_state
+
+    git -C "$ROOT" diff --quiet || die "transaction produced unexpected unstaged changes"
+    if [ -n "$(git -C "$ROOT" ls-files --others --exclude-standard)" ]; then
+        die "transaction produced unexpected untracked files"
+    fi
 
     if [ "$push_changes" -eq 1 ]; then
-        git -C "$ROOT" diff --quiet || die "commit created, but unstaged changes prevent pull/push"
-        if [ -n "$(git -C "$ROOT" ls-files --others --exclude-standard)" ]; then
-            die "commit created, but untracked files prevent pull/push"
+        git -C "$ROOT" rebase "$SYNC_UPSTREAM_REF" \
+            || die "git rebase failed; the transaction will be rolled back"
+        checkpoint_transaction_state
+    fi
+
+    snapshot_transaction_directories
+    snapshot_transaction_home
+    install_all "$mode"
+    checkpoint_transaction_state
+
+    if [ "$push_changes" -eq 1 ]; then
+        new_head=$(git -C "$ROOT" rev-parse HEAD) || die "cannot resolve transaction commit"
+        mark_transaction_in_doubt
+        TRANSACTION_PUSHING=1
+        if git -C "$ROOT" push "$SYNC_REMOTE" "HEAD:$SYNC_MERGE_REF"; then
+            push_confirmed=1
+        else
+            if git -C "$ROOT" fetch "$SYNC_REMOTE" "$SYNC_MERGE_REF" >/dev/null 2>&1; then
+                remote_head=$(git -C "$ROOT" rev-parse FETCH_HEAD 2>/dev/null || true)
+                if [ -n "$remote_head" ] && \
+                   { [ "$remote_head" = "$new_head" ] || \
+                     git -C "$ROOT" merge-base --is-ancestor "$new_head" "$remote_head"; }; then
+                    warn "push reported an error, but the remote contains the transaction commit"
+                    push_confirmed=1
+                fi
+            else
+                leave_transaction_in_doubt
+                return 2
+            fi
         fi
-        git -C "$ROOT" pull --rebase || die "commit is local, but git pull --rebase failed"
-        git -C "$ROOT" push || die "commit is local, but git push failed"
-        log "Updated from remote and pushed successfully."
+        TRANSACTION_PUSHING=0
+        [ "$push_confirmed" -eq 1 ] \
+            || die "git push failed and the remote did not confirm the transaction commit"
+    fi
+
+    finish_transaction
+    if [ "$push_changes" -eq 1 ]; then
+        log "Updated from remote, committed, deployed, and pushed successfully."
     elif [ "$committed" -eq 1 ]; then
         log "Commit is local. Run 'dotfiles sync' next time to push automatically."
     fi
-
-    install_all "$mode"
 }
 
 write_device_config() {
@@ -601,6 +1346,8 @@ config_command() {
             key=${2:-}
             value=${3:-}
             [ -n "$key" ] || die "usage: $PROGRAM config set <install-mode|conda-root> VALUE"
+            acquire_transaction_lock
+            assert_no_pending_transaction
             case "$key" in
                 install-mode)
                     case "$value" in auto|link|copy) ;; *) die "install-mode must be auto, link, or copy" ;; esac
@@ -614,9 +1361,12 @@ config_command() {
             esac
             write_device_config
             write_generated_env
+            finish_locked_mutation
             ;;
         unset)
             key=${2:-}
+            acquire_transaction_lock
+            assert_no_pending_transaction
             case "$key" in
                 conda-root) DOTFILES_DEVICE_CONDA_ROOT="" ;;
                 install-mode) DOTFILES_INSTALL_MODE=auto ;;
@@ -624,6 +1374,7 @@ config_command() {
             esac
             write_device_config
             write_generated_env
+            finish_locked_mutation
             ;;
         *) die "usage: $PROGRAM config [list|set|unset]" ;;
     esac
@@ -668,13 +1419,26 @@ doctor() {
 }
 
 update_repository() {
+    local mode
     command -v git >/dev/null 2>&1 || die "git is required for update"
     git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$ROOT is not a Git worktree"
+    acquire_transaction_lock
+    assert_no_pending_transaction
     if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
         die "repository has uncommitted changes; commit or stash them before update"
     fi
-    git -C "$ROOT" pull --ff-only || die "git pull failed"
-    exec "$ROOT/bin/dotfiles" install
+    mode=$(resolved_mode)
+    prepare_remote_sync
+    begin_transaction
+    git -C "$ROOT" merge --ff-only "$SYNC_UPSTREAM_REF" \
+        || die "fast-forward update failed; the transaction will be rolled back"
+    checkpoint_transaction_state
+    snapshot_transaction_directories
+    snapshot_transaction_home
+    install_all "$mode"
+    checkpoint_transaction_state
+    finish_transaction
+    log "Fast-forwarded and deployed successfully."
 }
 
 usage() {
@@ -692,10 +1456,12 @@ Commands:
   config set conda-root PATH      Persist this device's Conda root
   config unset KEY                Reset a device setting
   doctor                          Check platform, tools, and secret hygiene
-  update                          Fast-forward Git, then reinstall
-  save [-m MESSAGE] [--mode ...]  Capture copies, commit, and reinstall
+  update                          Transactionally fast-forward and reinstall
+  save|commit [-m MESSAGE] [--mode ...] [--push]
+                                  Transactionally capture, commit, and install
   sync|publish [-m MESSAGE] [--mode ...]
-                                  Save, rebase from remote, and push
+                                  Fetch, save, rebase, install, and push
+  recover [TRANSACTION_DIR]       Recover an interrupted or uncertain transaction
   root                            Print the active repository path
   help                            Show this help
 
@@ -770,7 +1536,12 @@ if [ "$#" -gt 0 ]; then shift; fi
 case "$COMMAND" in
     install|apply)
         parse_mode_and_dry_run "$@"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            acquire_transaction_lock
+            assert_no_pending_transaction
+        fi
         install_all "$PARSED_MODE"
+        [ "$DRY_RUN" -eq 1 ] || finish_locked_mutation
         ;;
     status)
         parse_mode_and_dry_run "$@"
@@ -778,7 +1549,12 @@ case "$COMMAND" in
         ;;
     uninstall|unlink)
         parse_mode_and_dry_run "$@"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            acquire_transaction_lock
+            assert_no_pending_transaction
+        fi
         uninstall_all "$PARSED_MODE"
+        [ "$DRY_RUN" -eq 1 ] || finish_locked_mutation
         ;;
     config) config_command "$@" ;;
     doctor) doctor ;;
@@ -790,6 +1566,10 @@ case "$COMMAND" in
     publish|sync)
         parse_save_options 1 "$@"
         save_repository "$SAVE_MODE" "$SAVE_MESSAGE" "$SAVE_PUSH"
+        ;;
+    recover)
+        [ "$#" -le 1 ] || die "usage: $PROGRAM recover [TRANSACTION_DIR]"
+        recover_transaction "${1:-}"
         ;;
     root) printf '%s\n' "$ROOT" ;;
     help|-h|--help) usage ;;
