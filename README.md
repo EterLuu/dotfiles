@@ -132,6 +132,252 @@ dotfiles config unset conda-root
 其他设备专属 SDK 路径应写入 `local.profile`，不要把绝对路径加入共享的
 `.zshrc` 或 `.bashrc`。
 
+## 配置放置教程：一般情况与特殊情况
+
+新增配置前先判断两个问题：它是否可以公开提交，以及它适用于全部平台、某个平台、
+某台主机，还是仅当前设备。不要在 `.bashrc`、`.zshrc` 中堆叠大量 `uname`、主机名
+和绝对路径判断；本仓库已经把这些边界分开。
+
+### 配置位置速查
+
+| 使用范围 | 推荐文件 | 是否同步 | 适合内容 |
+| --- | --- | --- | --- |
+| 所有平台、所有 Shell 的环境 | `dotfiles/shell/env.sh` | 是 | `PATH`、`EDITOR`、通用环境变量 |
+| 所有平台的交互式 Shell | `dotfiles/shell/interactive.sh` | 是 | alias、函数、按键和交互工具 |
+| 某个平台的环境 | `profiles/<平台>/env.sh` | 是 | 平台 PATH、环境变量；不能产生输出或启动后台进程 |
+| 某个平台的交互行为 | `profiles/<平台>/shell.sh` | 是 | alias、函数、剪贴板、Agent 桥接等 |
+| 某台主机的公开交互配置 | `profiles/hosts/<短主机名>/shell.sh` | 是 | 不含机密的主机别名、工作目录函数 |
+| 当前设备的登录环境 | `~/.config/dotfiles/local.profile` | 否 | 私有 SDK 路径、需要由子进程继承的变量 |
+| 当前设备的 Bash/Zsh 配置 | `local.bash` / `local.zsh` | 否 | 私有 alias、代理和仅该 Shell 使用的命令 |
+| Git 身份 | `~/.config/git/local.conf` | 否 | 姓名、邮箱、签名密钥 |
+| SSH 主机 | `~/.ssh/config.local` | 否 | Host、用户名、密钥路径、ProxyJump |
+
+`<平台>` 可以是 `macos`、`linux`、`wsl` 或 `windows`。其中 `windows` 指原生
+Git Bash/MSYS2，WSL 会单独识别为 `wsl`，不会加载 `profiles/linux`。
+
+### 实际加载顺序
+
+登录环境的加载顺序是：
+
+```text
+generated.sh
+→ dotfiles/shell/env.sh
+→ profiles/<平台>/env.sh
+→ local.profile
+```
+
+交互式 Shell 的加载顺序是：
+
+```text
+generated.sh
+→ dotfiles/shell/env.sh
+→ profiles/<平台>/env.sh
+→ dotfiles/shell/interactive.sh
+→ profiles/<平台>/shell.sh
+→ profiles/hosts/<短主机名>/shell.sh
+→ local.bash 或 local.zsh
+```
+
+因此应遵守以下规则：
+
+- `env.sh` 必须可重复加载，不输出文字、不等待输入、不启动后台进程；
+- alias、交互函数和需要启动进程的配置放在 `shell.sh`；
+- 本机覆盖最后加载，可以覆盖共享 alias 或变量；
+- `local.profile` 只保证由登录 Shell 读取。非登录 Shell 通常继承登录环境；如果某个
+  启动器没有继承它，应把设置放入对应的 `local.bash`/`local.zsh`，或从二者共同
+  source 一个设备本地脚本。
+
+可以检查当前选择的平台和主机：
+
+```bash
+printf 'platform=%s host=%s\n' "$DOTFILES_OS" "$DOTFILES_HOST"
+```
+
+如果变量为空或平台不正确，先重新执行 `dotfiles install` 生成当前设备环境。
+
+### 一般情况一：增加平台专属环境变量
+
+例如某个缓存目录只适用于 macOS，应修改 `profiles/macos/env.sh`：
+
+```sh
+export TOOL_CACHE_HOME="$HOME/Library/Caches/tool"
+```
+
+如果只适用于 Linux，则写入 `profiles/linux/env.sh`；不要在共享 `env.sh` 中再写
+`if [ "$(uname)" = ... ]`。平台环境会同时提供给 Bash 和 Zsh，所以语法应兼容两者，
+并尽量使用 POSIX Shell 写法。
+
+### 一般情况二：增加平台 alias 或函数
+
+例如某个命令只在 Linux 上存在，应修改 `profiles/linux/shell.sh`：
+
+```sh
+if command -v systemctl >/dev/null 2>&1; then
+    alias user-services='systemctl --user --type=service'
+fi
+```
+
+这种配置只在交互式 Shell 中加载，不会污染脚本或 `scp` 等非交互命令。
+
+### 一般情况三：增加主机或设备配置
+
+可以公开、且需要跟随某个主机名同步的交互配置放在：
+
+```text
+profiles/hosts/<hostname>/shell.sh
+```
+
+这里使用 `hostname` 的第一个点号之前的短名称。不要提交公司内网地址、用户名、
+token 或私钥路径；这类设置放入 `local.bash`、`local.zsh`、`local.profile`、
+`git/local.conf` 或 `ssh/config.local`。
+
+例如只有当前 Bash 设备需要的工作目录别名：
+
+```sh
+# ~/.config/dotfiles/local.bash
+alias work='cd /private/device/path/to/workspace'
+```
+
+### 一般情况四：增加新的托管文件
+
+要同步一个新的普通配置文件，先在仓库中创建源文件，再加入 manifest：
+
+```text
+# .dotfiles-manifest
+all|dotfiles/tool/config|.config/tool/config
+wsl|dotfiles/tool/wsl.conf|.config/tool/platform.conf
+```
+
+然后检查并同步：
+
+```bash
+dotfiles install --dry-run
+dotfiles install
+dotfiles status
+dotfiles sync -m "tool: add shared configuration"
+```
+
+manifest 只放可公开的普通文件。凭据、设备绝对路径以及运行时生成内容不能作为源文件
+加入仓库。
+
+### 特殊情况：WSL 使用 Windows OpenSSH Agent
+
+适用场景是：私钥由 Windows `ssh-agent` 持有，WSL 中的 `ssh`、Git 和开发工具通过
+Unix socket 访问 Windows named pipe。所有 WSL 设备都使用这种方式时，共享环境变量
+写入 `profiles/wsl/env.sh`：
+
+```sh
+# Windows OpenSSH agent bridge socket inside WSL.
+export SSH_AUTH_SOCK="$HOME/.ssh/agent.sock"
+```
+
+后台桥接只应在交互式 Shell 中启动，因此把以下内容加入
+`profiles/wsl/shell.sh`：
+
+```sh
+# Bridge WSL SSH clients to the Windows OpenSSH agent.
+dotfiles_ssh_agent_status=2
+if command -v ssh-add >/dev/null 2>&1; then
+    ssh-add -l >/dev/null 2>&1
+    dotfiles_ssh_agent_status=$?
+fi
+
+# ssh-add: 0=Agent 中有密钥，1=Agent 可用但没有密钥，2=无法连接 Agent。
+case "$dotfiles_ssh_agent_status" in
+    0|1) ;;
+    *)
+        if [ -e "$SSH_AUTH_SOCK" ] && [ ! -S "$SSH_AUTH_SOCK" ]; then
+            printf 'warning: refusing to replace non-socket path: %s\n' \
+                "$SSH_AUTH_SOCK" >&2
+        elif command -v socat >/dev/null 2>&1 &&
+           command -v setsid >/dev/null 2>&1 &&
+           command -v npiperelay.exe >/dev/null 2>&1; then
+            mkdir -p "$HOME/.ssh"
+            chmod 700 "$HOME/.ssh"
+            rm -f "$SSH_AUTH_SOCK"
+
+            setsid socat \
+                "UNIX-LISTEN:$SSH_AUTH_SOCK,fork,mode=600" \
+                "EXEC:npiperelay.exe -ei -s //./pipe/openssh-ssh-agent,nofork" \
+                >/dev/null 2>&1 &
+
+            sleep 0.2
+        else
+            printf '%s\n' \
+                'warning: WSL SSH agent bridge requires socat, setsid and npiperelay.exe' >&2
+        fi
+        ;;
+esac
+unset dotfiles_ssh_agent_status
+```
+
+不能简单使用 `if ! ssh-add -l`：当 Agent 正常但尚无密钥时，`ssh-add -l` 也可能
+返回 `1`；这种情况不应删除 socket 并重复启动 `socat`。
+
+准备条件：
+
+1. Windows 的 **OpenSSH Authentication Agent** 服务已经启动，并设置为按需或
+   自动启动；私钥应在 Windows 侧加入 Agent，不要复制进仓库；
+2. WSL 已安装 `socat` 和提供 `setsid` 的 util-linux；
+3. `npiperelay.exe` 可以从 WSL 的 `PATH` 找到。
+
+可以在管理员 PowerShell 中启用 Windows Agent：
+
+```powershell
+Set-Service -Name ssh-agent -StartupType Automatic
+Start-Service -Name ssh-agent
+Get-Service -Name ssh-agent
+```
+
+然后在普通 PowerShell 中把私钥加入 Windows Agent，例如：
+
+```powershell
+ssh-add "$env:USERPROFILE\.ssh\id_ed25519"
+ssh-add -l
+```
+
+私钥文件仍只保存在本机；不要把它复制到 WSL dotfiles 仓库。
+
+如果每台设备上的 `npiperelay.exe` 路径不同，不要把 `/mnt/c/Users/...` 绝对路径写入
+共享 profile。可以在该设备的 `~/.local/bin` 创建同名包装脚本，因为此目录已经由
+共享环境加入 `PATH`：
+
+```sh
+#!/usr/bin/env sh
+exec "/mnt/c/Users/<当前用户>/path/to/npiperelay.exe" "$@"
+```
+
+保存为 `~/.local/bin/npiperelay.exe` 并执行：
+
+```bash
+chmod 700 ~/.local/bin/npiperelay.exe
+```
+
+这个包装脚本是设备本地文件，不加入 manifest。如果 Agent 桥接只属于一台 WSL，
+则不要修改 `profiles/wsl`；把 `SSH_AUTH_SOCK` 和完整启动逻辑放入该设备的
+`~/.config/dotfiles/local.bash`。Zsh 用户对应使用 `local.zsh`；同时使用两种 Shell
+时，可以让两者 source 同一个未纳入仓库的设备本地脚本。
+
+提交共享配置并重载 Shell：
+
+```bash
+dotfiles sync -m "wsl: bridge Windows OpenSSH agent"
+exec "${SHELL:-bash}" -l
+```
+
+依次排查：
+
+```bash
+printf '%s\n' "$DOTFILES_OS"                  # 应为 wsl
+command -v ssh-add socat setsid npiperelay.exe
+printf '%s\n' "$SSH_AUTH_SOCK"
+ls -l "$SSH_AUTH_SOCK"
+ssh-add -l
+```
+
+`ssh-add -l` 显示“no identities”说明桥接已经可用，但 Windows Agent 中还没有密钥；
+显示“Could not open a connection”才表示 socket 或桥接进程有问题。
+
 ## SSH 与机密信息
 
 仓库只同步 SSH 的通用安全/连接行为。以下内容绝不能提交：
