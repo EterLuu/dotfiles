@@ -85,4 +85,59 @@ run_dotfiles uninstall --mode copy >/dev/null 2>&1
 [ -f "$TEST_HOME/.bashrc" ] || fail 'modified copied file should be kept on uninstall'
 [ -f "$TEST_HOME/.config/dotfiles/local.bash" ] || fail 'copy uninstall removed local config'
 
+# Exercise save/sync in an isolated repository with a local bare remote.
+SAVE_REPO=$TEST_TMP/save-repository
+SAVE_REMOTE=$TEST_TMP/save-remote.git
+SAVE_HOME=$TEST_TMP/save-home
+mkdir -p "$SAVE_REPO" "$SAVE_HOME"
+cp -R "$TEST_ROOT/." "$SAVE_REPO/"
+rm -rf "$SAVE_REPO/.git"
+git -C "$SAVE_REPO" init -q
+git -C "$SAVE_REPO" config user.name 'Dotfiles Test'
+git -C "$SAVE_REPO" config user.email 'dotfiles-test@example.invalid'
+git -C "$SAVE_REPO" config commit.gpgSign false
+git -C "$SAVE_REPO" config core.autocrlf false
+git -C "$SAVE_REPO" add -A
+git -C "$SAVE_REPO" commit -q -m 'initial dotfiles'
+git init -q --bare "$SAVE_REMOTE"
+git -C "$SAVE_REPO" remote add origin "$SAVE_REMOTE"
+SAVE_BRANCH=$(git -C "$SAVE_REPO" symbolic-ref --short HEAD)
+git -C "$SAVE_REPO" push -q -u origin "$SAVE_BRANCH"
+
+run_saved_dotfiles() {
+    HOME=$SAVE_HOME \
+    XDG_CONFIG_HOME=$SAVE_HOME/.config \
+    XDG_STATE_HOME=$SAVE_HOME/.local/state \
+    "$SAVE_REPO/bin/dotfiles" "$@"
+}
+
+run_saved_dotfiles install --mode copy >/dev/null
+printf '\n" captured from HOME\n' >> "$SAVE_HOME/.vimrc"
+run_saved_dotfiles sync --mode copy -m 'capture vim from home' >/dev/null 2>&1
+grep -q 'captured from HOME' "$SAVE_REPO/dotfiles/vim/vimrc" \
+    || fail 'sync did not capture a HOME copy'
+[ "$(git --git-dir="$SAVE_REMOTE" log -1 --format=%s)" = 'capture vim from home' ] \
+    || fail 'sync did not push the requested commit'
+cmp -s "$SAVE_HOME/.vimrc" "$SAVE_REPO/dotfiles/vim/vimrc" \
+    || fail 'sync did not reinstall the committed configuration'
+
+printf '\n# changed in repository\n' >> "$SAVE_REPO/dotfiles/bash/bashrc"
+run_saved_dotfiles save --mode copy -m 'repository-side update' >/dev/null
+grep -q 'changed in repository' "$SAVE_HOME/.bashrc" \
+    || fail 'save overwrote or failed to install a repository-side update'
+
+printf '%s\n' '-----BEGIN OPENSSH PRIVATE KEY-----' 'not-a-real-key' \
+    > "$SAVE_REPO/dotfiles/ssh/leak.conf"
+if run_saved_dotfiles save --mode copy -m 'must reject secret' >/dev/null 2>&1; then
+    fail 'save did not reject staged private-key content'
+fi
+git -C "$SAVE_REPO" reset -q HEAD -- dotfiles/ssh/leak.conf
+rm "$SAVE_REPO/dotfiles/ssh/leak.conf"
+
+printf '\n# repository conflict side\n' >> "$SAVE_REPO/dotfiles/bash/bashrc"
+printf '\n# home conflict side\n' >> "$SAVE_HOME/.bashrc"
+if run_saved_dotfiles save --mode copy -m 'must conflict' >/dev/null 2>&1; then
+    fail 'save did not reject a two-sided copy conflict'
+fi
+
 printf 'All dotfiles integration tests passed.\n'

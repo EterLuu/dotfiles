@@ -69,6 +69,8 @@ dotfiles install --dry-run           # 只显示动作
 dotfiles status                      # 检查缺失、错误链接或副本漂移
 dotfiles doctor                      # 检查依赖、平台和疑似私钥
 dotfiles update                      # git pull --ff-only 后重新安装
+dotfiles save -m "update vim"        # 收集副本、创建本地 commit 并重新安装
+dotfiles sync -m "sync configs"      # 提交 + pull --rebase + push，一键同步
 dotfiles uninstall                   # 只删除未被修改的托管文件
 dotfiles root                        # 显示当前仓库位置
 dotfiles config list                 # 显示设备设置
@@ -88,9 +90,11 @@ dotfiles config set install-mode link   # auto、link 或 copy
 dotfiles install
 ```
 
-也可用 `dotfiles install --mode copy` 做单次覆盖。复制模式必须在仓库里编辑源文件，
-然后重新运行 `install`；`status` 会发现 HOME 副本与仓库的差异。Windows 上若需
-完整 Unix 行为，优先选择 WSL。此仓库不自动管理 PowerShell Profile。
+也可用 `dotfiles install --mode copy` 做单次覆盖。复制模式既可以在仓库里编辑
+源文件，也可以直接编辑 HOME 副本后用 `dotfiles save` 安全回收；工具保存了上次
+部署基线，能区分“仓库有更新”“HOME 有更新”和“两边同时修改”的冲突。`status`
+会发现 HOME 副本与仓库的差异。Windows 上若需完整 Unix 行为，优先选择 WSL。
+此仓库不自动管理 PowerShell Profile。
 
 ## Conda、Miniconda 与设备路径
 
@@ -129,6 +133,21 @@ dotfiles config unset conda-root
 文件名，但它不能替代提交前审查和 secret scanner。
 
 ## 在设备之间同步
+
+推荐的一键方式：
+
+```bash
+dotfiles save -m "update shell settings"       # 只创建本地 commit
+dotfiles sync -m "update shell settings"       # 提交、拉取远端更新并推送
+```
+
+`sync`（别名 `publish`）的完整顺序是：收集复制模式下修改过的 HOME 配置、
+仅暂存本项目允许的配置目录、检查疑似私钥和常见 token、创建 commit、执行 `git pull --rebase`、
+`git push`，最后重新部署。若省略 `-m`，会使用包含时间的自动消息。
+如果仓库与 HOME 自上次部署后修改了同一个复制文件，命令会停止并报告冲突，
+不会猜测应该覆盖哪一边。
+
+需要逐步检查时仍可手动执行：
 
 在修改配置的设备上：
 

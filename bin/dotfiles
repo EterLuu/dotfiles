@@ -306,6 +306,23 @@ backup_target() {
     log "backed up: $target -> $backup_target"
 }
 
+copy_base_path() {
+    printf '%s\n' "$XDG_STATE_HOME/dotfiles/copy-base/$1"
+}
+
+record_copy_base() {
+    local source_path relative_target base_path
+    source_path=$1
+    relative_target=$2
+    base_path=$(copy_base_path "$relative_target")
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[dry-run] record copy baseline for $relative_target"
+        return
+    fi
+    mkdir -p "$(dirname "$base_path")" || die "cannot create copy baseline directory"
+    cp -p "$source_path" "$base_path" || die "cannot record copy baseline: $relative_target"
+}
+
 install_one() {
     local source_path relative_target target_path mode current_link
     source_path=$1
@@ -322,6 +339,7 @@ install_one() {
             return
         fi
     elif [ "$mode" = copy ] && [ ! -L "$target_path" ] && [ -f "$target_path" ] && cmp -s "$source_path" "$target_path"; then
+        record_copy_base "$source_path" "$relative_target"
         log "ok: $relative_target"
         return
     fi
@@ -337,6 +355,7 @@ install_one() {
         log "linked: $relative_target"
     else
         cp -p "$source_path" "$target_path" || die "cannot copy $target_path"
+        record_copy_base "$source_path" "$relative_target"
         log "copied: $relative_target"
     fi
 }
@@ -392,7 +411,7 @@ status_all() {
 }
 
 uninstall_all() {
-    local mode scope source_rel target_rel source_path target_path current_link removed kept
+    local mode scope source_rel target_rel source_path target_path current_link base_path removed kept
     mode=$(resolved_mode "${1:-}")
     removed=0
     kept=0
@@ -412,6 +431,12 @@ uninstall_all() {
                 log "[dry-run] remove $target_path"
             else
                 rm "$target_path" || die "cannot remove $target_path"
+                if [ "$mode" = copy ]; then
+                    base_path=$(copy_base_path "$target_rel")
+                    if [ -f "$base_path" ]; then
+                        rm "$base_path" || die "cannot remove copy baseline: $base_path"
+                    fi
+                fi
                 log "removed: $target_rel"
             fi
             removed=$((removed + 1))
@@ -422,6 +447,128 @@ uninstall_all() {
     done < "$MANIFEST"
     log "Removed $removed managed files; kept $kept modified/unmanaged files."
     log "Device-local files and backups were not removed."
+}
+
+preflight_copy_capture() {
+    local scope source_rel target_rel source_path target_path base_path source_changed target_changed
+    while IFS='|' read -r scope source_rel target_rel; do
+        case "$scope" in ""|\#*) continue ;; esac
+        scope_applies "$scope" || continue
+        validate_relative_path "$target_rel"
+        source_path=$ROOT/$source_rel
+        target_path=$HOME/$target_rel
+        base_path=$(copy_base_path "$target_rel")
+        [ -f "$source_path" ] || die "manifest source is missing: $source_rel"
+        if [ -L "$target_path" ] || [ ! -f "$target_path" ]; then
+            die "copy-mode target is missing or not a regular file: $target_rel; run dotfiles install --mode copy"
+        fi
+        if [ ! -f "$base_path" ]; then
+            if cmp -s "$source_path" "$target_path"; then
+                record_copy_base "$source_path" "$target_rel"
+            else
+                die "cannot determine which copy is newer: $target_rel; reconcile it manually, then run install --mode copy"
+            fi
+        fi
+        source_changed=0
+        target_changed=0
+        cmp -s "$source_path" "$base_path" || source_changed=1
+        cmp -s "$target_path" "$base_path" || target_changed=1
+        if [ "$source_changed" -eq 1 ] && [ "$target_changed" -eq 1 ] && ! cmp -s "$source_path" "$target_path"; then
+            die "copy conflict: both repository and HOME changed $target_rel"
+        fi
+    done < "$MANIFEST"
+}
+
+capture_copy_changes() {
+    local scope source_rel target_rel source_path target_path base_path captured
+    captured=0
+    preflight_copy_capture
+    while IFS='|' read -r scope source_rel target_rel; do
+        case "$scope" in ""|\#*) continue ;; esac
+        scope_applies "$scope" || continue
+        source_path=$ROOT/$source_rel
+        target_path=$HOME/$target_rel
+        base_path=$(copy_base_path "$target_rel")
+        if ! cmp -s "$target_path" "$base_path" && cmp -s "$source_path" "$base_path"; then
+            cp -p "$target_path" "$source_path" || die "cannot capture $target_rel"
+            log "captured: $target_rel"
+            captured=$((captured + 1))
+        fi
+    done < "$MANIFEST"
+    log "Captured $captured changed HOME copies."
+}
+
+check_staged_secrets() {
+    local staged_list staged_file base_name suspicious
+    staged_list=$XDG_STATE_HOME/dotfiles/staged-files.$$
+    mkdir -p "$(dirname "$staged_list")" || die "cannot create dotfiles state directory"
+    git -C "$ROOT" diff --cached --name-only --diff-filter=ACMR > "$staged_list" \
+        || die "cannot inspect staged files"
+    suspicious=""
+    while IFS= read -r staged_file; do
+        [ -n "$staged_file" ] || continue
+        base_name=${staged_file##*/}
+        case "$base_name" in
+            id_rsa*|id_dsa*|id_ecdsa*|id_ed25519*|*.pem|*.key|.env|.env.*)
+                suspicious=$staged_file
+                break
+                ;;
+        esac
+        if git -C "$ROOT" show ":$staged_file" 2>/dev/null | \
+            grep -Eq -- 'BEGIN ([A-Z0-9]+ )?PRIVATE KEY|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}'; then
+            suspicious=$staged_file
+            break
+        fi
+    done < "$staged_list"
+    rm "$staged_list" || true
+    [ -z "$suspicious" ] || die "refusing to commit a possible secret: $suspicious"
+}
+
+save_repository() {
+    local mode message push_changes committed
+    mode=$1
+    message=$2
+    push_changes=$3
+    committed=0
+
+    command -v git >/dev/null 2>&1 || die "git is required for save"
+    git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$ROOT is not a Git worktree"
+    git -C "$ROOT" diff --cached --quiet || die "repository already has staged changes; commit or unstage them first"
+
+    if [ "$mode" = copy ]; then
+        capture_copy_changes
+    fi
+
+    git -C "$ROOT" add -A -- \
+        .dotfiles-manifest .gitattributes .gitignore README.md \
+        bin dotfiles examples profiles tests || die "git add failed"
+
+    if ! git -C "$ROOT" diff --cached --quiet; then
+        git -C "$ROOT" diff --cached --check || die "staged changes contain whitespace errors"
+        check_staged_secrets
+        if [ -z "$message" ]; then
+            message="dotfiles: update $(date '+%Y-%m-%d %H:%M')"
+        fi
+        git -C "$ROOT" commit -m "$message" || die "git commit failed; staged changes were kept"
+        committed=1
+        log "Created dotfiles commit."
+    else
+        log "No dotfiles changes to commit."
+    fi
+
+    if [ "$push_changes" -eq 1 ]; then
+        git -C "$ROOT" diff --quiet || die "commit created, but unstaged changes prevent pull/push"
+        if [ -n "$(git -C "$ROOT" ls-files --others --exclude-standard)" ]; then
+            die "commit created, but untracked files prevent pull/push"
+        fi
+        git -C "$ROOT" pull --rebase || die "commit is local, but git pull --rebase failed"
+        git -C "$ROOT" push || die "commit is local, but git push failed"
+        log "Updated from remote and pushed successfully."
+    elif [ "$committed" -eq 1 ]; then
+        log "Commit is local. Run 'dotfiles sync' next time to push automatically."
+    fi
+
+    install_all "$mode"
 }
 
 write_device_config() {
@@ -546,6 +693,9 @@ Commands:
   config unset KEY                Reset a device setting
   doctor                          Check platform, tools, and secret hygiene
   update                          Fast-forward Git, then reinstall
+  save [-m MESSAGE] [--mode ...]  Capture copies, commit, and reinstall
+  sync|publish [-m MESSAGE] [--mode ...]
+                                  Save, rebase from remote, and push
   root                            Print the active repository path
   help                            Show this help
 
@@ -554,6 +704,8 @@ Examples:
   ./bin/dotfiles install
   dotfiles config set conda-root "\$HOME/miniconda3"
   dotfiles status
+  dotfiles save -m "update vim settings"
+  dotfiles sync -m "sync dotfiles"
 EOF
 }
 
@@ -574,6 +726,45 @@ parse_mode_and_dry_run() {
     PARSED_MODE=$(resolved_mode "$PARSED_MODE")
 }
 
+parse_save_options() {
+    SAVE_MODE=""
+    SAVE_MESSAGE=""
+    SAVE_PUSH=${1:-0}
+    if [ "$#" -gt 0 ]; then shift; fi
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --mode)
+                [ "$#" -ge 2 ] || die "--mode requires a value"
+                SAVE_MODE=$2
+                shift 2
+                ;;
+            --mode=*) SAVE_MODE=${1#--mode=}; shift ;;
+            -m|--message)
+                [ "$#" -ge 2 ] || die "$1 requires a value"
+                SAVE_MESSAGE=$2
+                shift 2
+                ;;
+            --message=*) SAVE_MESSAGE=${1#--message=}; shift ;;
+            --push) SAVE_PUSH=1; shift ;;
+            --)
+                shift
+                [ "$#" -gt 0 ] || die "-- must be followed by a commit message"
+                [ -z "$SAVE_MESSAGE" ] || die "commit message was provided more than once"
+                SAVE_MESSAGE=$1
+                shift
+                [ "$#" -eq 0 ] || die "unexpected arguments after commit message"
+                ;;
+            -*) die "unknown option: $1" ;;
+            *)
+                [ -z "$SAVE_MESSAGE" ] || die "commit message was provided more than once"
+                SAVE_MESSAGE=$1
+                shift
+                ;;
+        esac
+    done
+    SAVE_MODE=$(resolved_mode "$SAVE_MODE")
+}
+
 COMMAND=${1:-help}
 if [ "$#" -gt 0 ]; then shift; fi
 case "$COMMAND" in
@@ -592,6 +783,14 @@ case "$COMMAND" in
     config) config_command "$@" ;;
     doctor) doctor ;;
     update) update_repository ;;
+    save|commit)
+        parse_save_options 0 "$@"
+        save_repository "$SAVE_MODE" "$SAVE_MESSAGE" "$SAVE_PUSH"
+        ;;
+    publish|sync)
+        parse_save_options 1 "$@"
+        save_repository "$SAVE_MODE" "$SAVE_MESSAGE" "$SAVE_PUSH"
+        ;;
     root) printf '%s\n' "$ROOT" ;;
     help|-h|--help) usage ;;
     *) usage >&2; die "unknown command: $COMMAND" ;;
