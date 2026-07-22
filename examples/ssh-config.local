@@ -1,0 +1,7 @@
+# Device-local SSH hosts, identity paths, proxy commands, and jump hosts.
+# Keep private keys in ~/.ssh with mode 600; never put them in this repository.
+#
+# Host example-work
+#     HostName server.example.com
+#     User your-user
+#     IdentityFile ~/.ssh/id_ed25519_work

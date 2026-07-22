@@ -1,0 +1,6 @@
+# Device-only hosts and options go here. This file is created by the installer
+# and is intentionally outside the repository.
+Include ~/.ssh/config.local
+
+# Shared host aliases and defaults live in the tracked 10-shared.conf file.
+Include ~/.ssh/config.d/*.conf

@@ -1,0 +1,19 @@
+# Never commit device-local overrides, keys, or generated state.
+device.conf
+generated.sh
+local.bash
+local.zsh
+local.profile
+*.pem
+*.key
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+
+# Editor and OS debris.
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

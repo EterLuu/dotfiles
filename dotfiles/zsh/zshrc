@@ -1,0 +1,57 @@
+# Portable interactive Zsh configuration.
+
+dotfiles_generated=${XDG_CONFIG_HOME:-"$HOME/.config"}/dotfiles/generated.sh
+[[ -r "$dotfiles_generated" ]] && source "$dotfiles_generated"
+unset dotfiles_generated
+
+if [[ -n ${DOTFILES_ROOT:-} && -r "$DOTFILES_ROOT/dotfiles/shell/env.sh" ]]; then
+    source "$DOTFILES_ROOT/dotfiles/shell/env.sh"
+fi
+
+[[ -o interactive ]] || return
+
+setopt AUTO_CD AUTO_PUSHD PUSHD_IGNORE_DUPS
+setopt INTERACTIVE_COMMENTS NO_BEEP
+setopt HIST_IGNORE_DUPS HIST_IGNORE_SPACE HIST_REDUCE_BLANKS
+setopt INC_APPEND_HISTORY SHARE_HISTORY EXTENDED_HISTORY
+
+HISTFILE=${XDG_STATE_HOME:-"$HOME/.local/state"}/zsh/history
+HISTSIZE=50000
+SAVEHIST=50000
+
+autoload -Uz compinit
+dotfiles_zcompdump=${XDG_CACHE_HOME:-"$HOME/.cache"}/zsh/zcompdump
+mkdir -p "${dotfiles_zcompdump:h}"
+compinit -i -d "$dotfiles_zcompdump"
+unset dotfiles_zcompdump
+
+autoload -Uz colors && colors
+bindkey -e
+bindkey '^[[A' history-beginning-search-backward
+bindkey '^[[B' history-beginning-search-forward
+PROMPT='%F{cyan}%n@%m%f:%F{blue}%~%f %# '
+RPROMPT='%(?..%F{red}%?%f)'
+
+typeset -U path PATH
+
+if [[ -n ${DOTFILES_CONDA_EXE:-} && -f "$DOTFILES_CONDA_EXE" ]]; then
+    conda() {
+        local dotfiles_conda_hook
+        dotfiles_conda_hook=$("$DOTFILES_CONDA_EXE" shell.zsh hook 2>/dev/null) || {
+            "$DOTFILES_CONDA_EXE" "$@"
+            return $?
+        }
+        unfunction conda
+        eval "$dotfiles_conda_hook"
+        unset dotfiles_conda_hook
+        conda "$@"
+    }
+fi
+
+if [[ -n ${DOTFILES_ROOT:-} && -r "$DOTFILES_ROOT/dotfiles/shell/interactive.sh" ]]; then
+    source "$DOTFILES_ROOT/dotfiles/shell/interactive.sh"
+fi
+
+dotfiles_local_zsh=${XDG_CONFIG_HOME:-"$HOME/.config"}/dotfiles/local.zsh
+[[ -r "$dotfiles_local_zsh" ]] && source "$dotfiles_local_zsh"
+unset dotfiles_local_zsh

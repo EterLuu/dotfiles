@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+# A dependency-free dotfiles manager. Compatible with Bash 3.2+.
+
+set -u
+
+PROGRAM=${0##*/}
+DRY_RUN=0
+BACKUP_DIR=""
+
+log() {
+    printf '%s\n' "$*"
+}
+
+warn() {
+    printf 'warning: %s\n' "$*" >&2
+}
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+resolve_script_root() {
+    local source_path dir_path link_path
+    source_path=$0
+    case "$source_path" in
+        /*) ;;
+        *) source_path=$PWD/$source_path ;;
+    esac
+
+    while [ -L "$source_path" ]; do
+        dir_path=$(cd -P "$(dirname "$source_path")" >/dev/null 2>&1 && pwd) || exit 1
+        link_path=$(readlink "$source_path") || exit 1
+        case "$link_path" in
+            /*) source_path=$link_path ;;
+            *) source_path=$dir_path/$link_path ;;
+        esac
+    done
+    dir_path=$(cd -P "$(dirname "$source_path")" >/dev/null 2>&1 && pwd) || exit 1
+    (cd "$dir_path/.." >/dev/null 2>&1 && pwd)
+}
+
+: "${HOME:?HOME must be set}"
+XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-"$HOME/.config"}
+XDG_STATE_HOME=${XDG_STATE_HOME:-"$HOME/.local/state"}
+CONFIG_DIR=$XDG_CONFIG_HOME/dotfiles
+ROOT_HINT=$CONFIG_DIR/root
+DERIVED_ROOT=$(resolve_script_root)
+
+if [ -n "${DOTFILES_ROOT:-}" ] && [ -f "$DOTFILES_ROOT/.dotfiles-manifest" ]; then
+    ROOT=$DOTFILES_ROOT
+elif [ -f "$DERIVED_ROOT/.dotfiles-manifest" ]; then
+    # A command run directly from a repository must win over a stale hint from
+    # another clone. A copied command has no manifest beside it and falls back.
+    ROOT=$DERIVED_ROOT
+elif [ -r "$ROOT_HINT" ]; then
+    IFS= read -r ROOT < "$ROOT_HINT"
+    if [ ! -f "$ROOT/.dotfiles-manifest" ]; then
+        ROOT=$DERIVED_ROOT
+    fi
+else
+    ROOT=$DERIVED_ROOT
+fi
+
+MANIFEST=$ROOT/.dotfiles-manifest
+[ -f "$MANIFEST" ] || die "cannot find .dotfiles-manifest; set DOTFILES_ROOT to the repository"
+
+DEVICE_CONFIG=$CONFIG_DIR/device.conf
+DOTFILES_DEVICE_CONDA_ROOT=${DOTFILES_DEVICE_CONDA_ROOT:-}
+DOTFILES_INSTALL_MODE=${DOTFILES_INSTALL_MODE:-auto}
+if [ -r "$DEVICE_CONFIG" ]; then
+    # This file is deliberately local to the device and owned by the user.
+    # shellcheck disable=SC1090
+    . "$DEVICE_CONFIG"
+fi
+
+detect_os() {
+    local kernel
+    kernel=$(uname -s 2>/dev/null || printf unknown)
+    case "$kernel" in
+        Darwin) printf 'macos\n' ;;
+        Linux)
+            if [ -r /proc/version ] && grep -qi microsoft /proc/version 2>/dev/null; then
+                printf 'wsl\n'
+            else
+                printf 'linux\n'
+            fi
+            ;;
+        MINGW*|MSYS*|CYGWIN*) printf 'windows\n' ;;
+        *) printf 'unknown\n' ;;
+    esac
+}
+
+OS=$(detect_os)
+HOST_NAME=$(hostname 2>/dev/null || uname -n 2>/dev/null || printf unknown)
+HOST_NAME=${HOST_NAME%%.*}
+
+scope_applies() {
+    local scope item old_ifs
+    scope=$1
+    old_ifs=$IFS
+    IFS=,
+    for item in $scope; do
+        case "$item" in
+            all) IFS=$old_ifs; return 0 ;;
+            unix)
+                case "$OS" in macos|linux|wsl) IFS=$old_ifs; return 0 ;; esac
+                ;;
+            "$OS") IFS=$old_ifs; return 0 ;;
+        esac
+    done
+    IFS=$old_ifs
+    return 1
+}
+
+validate_relative_path() {
+    case "$1" in
+        ""|/*|..|../*|*/../*|*/..) die "unsafe manifest target: $1" ;;
+    esac
+}
+
+resolved_mode() {
+    local requested
+    requested=${1:-$DOTFILES_INSTALL_MODE}
+    case "$requested" in
+        auto)
+            if [ "$OS" = windows ]; then
+                printf 'copy\n'
+            else
+                printf 'link\n'
+            fi
+            ;;
+        link|copy) printf '%s\n' "$requested" ;;
+        *) die "install mode must be auto, link, or copy" ;;
+    esac
+}
+
+shell_quote() {
+    local escaped
+    escaped=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+    printf "'%s'" "$escaped"
+}
+
+make_dir() {
+    if [ -d "$1" ]; then
+        return
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[dry-run] mkdir -p $1"
+    else
+        mkdir -p "$1" || die "cannot create directory: $1"
+    fi
+}
+
+write_root_hint() {
+    local tmp
+    make_dir "$CONFIG_DIR"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[dry-run] write $ROOT_HINT"
+        return
+    fi
+    tmp=$ROOT_HINT.tmp.$$
+    printf '%s\n' "$ROOT" > "$tmp" || die "cannot write $tmp"
+    mv "$tmp" "$ROOT_HINT" || die "cannot install $ROOT_HINT"
+}
+
+conda_from_root() {
+    local candidate_root conda_candidate
+    candidate_root=$1
+    [ -n "$candidate_root" ] || return 1
+    for conda_candidate in \
+        "$candidate_root/bin/conda" \
+        "$candidate_root/condabin/conda" \
+        "$candidate_root/Scripts/conda.exe" \
+        "$candidate_root/Scripts/conda"; do
+        if [ -x "$conda_candidate" ] || [ -f "$conda_candidate" ]; then
+            printf '%s\n' "$conda_candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+detect_conda() {
+    local executable base candidate
+    if [ -n "$DOTFILES_DEVICE_CONDA_ROOT" ]; then
+        conda_from_root "$DOTFILES_DEVICE_CONDA_ROOT"
+        return $?
+    fi
+    if [ -n "${CONDA_EXE:-}" ] && { [ -x "$CONDA_EXE" ] || [ -f "$CONDA_EXE" ]; }; then
+        printf '%s\n' "$CONDA_EXE"
+        return 0
+    fi
+    executable=$(command -v conda 2>/dev/null || true)
+    if [ -n "$executable" ] && { [ -x "$executable" ] || [ -f "$executable" ]; }; then
+        printf '%s\n' "$executable"
+        return 0
+    fi
+    for base in \
+        "$HOME/miniconda3" \
+        "$HOME/anaconda3" \
+        "$HOME/miniforge3" \
+        "$HOME/mambaforge" \
+        "/opt/homebrew/Caskroom/miniconda/base" \
+        "/usr/local/Caskroom/miniconda/base"; do
+        candidate=$(conda_from_root "$base" 2>/dev/null || true)
+        if [ -n "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+conda_root_from_exe() {
+    local parent
+    parent=$(dirname "$1")
+    case "${parent##*/}" in
+        bin|condabin|Scripts) dirname "$parent" ;;
+        *) printf '%s\n' "$parent" ;;
+    esac
+}
+
+write_generated_env() {
+    local generated tmp conda_exe conda_root
+    generated=$CONFIG_DIR/generated.sh
+    make_dir "$CONFIG_DIR"
+    conda_exe=$(detect_conda 2>/dev/null || true)
+    conda_root=""
+    if [ -n "$conda_exe" ]; then
+        conda_root=$(conda_root_from_exe "$conda_exe")
+    elif [ -n "$DOTFILES_DEVICE_CONDA_ROOT" ]; then
+        warn "configured Conda root has no conda executable: $DOTFILES_DEVICE_CONDA_ROOT"
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[dry-run] generate $generated (os=$OS, host=$HOST_NAME)"
+        return
+    fi
+
+    tmp=$generated.tmp.$$
+    {
+        printf '# Generated by dotfiles install. Do not edit.\n'
+        printf 'export DOTFILES_ROOT=%s\n' "$(shell_quote "$ROOT")"
+        printf 'export DOTFILES_OS=%s\n' "$(shell_quote "$OS")"
+        printf 'export DOTFILES_HOST=%s\n' "$(shell_quote "$HOST_NAME")"
+        if [ -n "$conda_exe" ]; then
+            printf 'export DOTFILES_CONDA_EXE=%s\n' "$(shell_quote "$conda_exe")"
+            printf 'export DOTFILES_CONDA_ROOT=%s\n' "$(shell_quote "$conda_root")"
+        else
+            printf 'unset DOTFILES_CONDA_EXE DOTFILES_CONDA_ROOT\n'
+        fi
+    } > "$tmp" || die "cannot write $tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$generated" || die "cannot install $generated"
+}
+
+ensure_local_file() {
+    local source_file target_file
+    source_file=$1
+    target_file=$2
+    if [ -e "$target_file" ] || [ -L "$target_file" ]; then
+        return
+    fi
+    make_dir "$(dirname "$target_file")"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[dry-run] create local config $target_file"
+    else
+        cp "$source_file" "$target_file" || die "cannot create $target_file"
+        chmod 600 "$target_file" 2>/dev/null || true
+        log "created local config: $target_file"
+    fi
+}
+
+ensure_runtime_files() {
+    make_dir "$XDG_STATE_HOME/dotfiles/backups"
+    make_dir "$XDG_STATE_HOME/zsh"
+    make_dir "$XDG_STATE_HOME/vim/backup"
+    make_dir "$XDG_STATE_HOME/vim/swap"
+    make_dir "$XDG_STATE_HOME/vim/undo"
+    make_dir "$HOME/.ssh/config.d"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        chmod 700 "$HOME/.ssh" "$HOME/.ssh/config.d" 2>/dev/null || true
+    fi
+    ensure_local_file "$ROOT/examples/local.zsh" "$CONFIG_DIR/local.zsh"
+    ensure_local_file "$ROOT/examples/local.bash" "$CONFIG_DIR/local.bash"
+    ensure_local_file "$ROOT/examples/local.profile" "$CONFIG_DIR/local.profile"
+    ensure_local_file "$ROOT/examples/git-local.conf" "$XDG_CONFIG_HOME/git/local.conf"
+    ensure_local_file "$ROOT/examples/ssh-config.local" "$HOME/.ssh/config.local"
+}
+
+backup_target() {
+    local target relative backup_target
+    target=$1
+    relative=${target#"$HOME"/}
+    if [ -z "$BACKUP_DIR" ]; then
+        BACKUP_DIR=$XDG_STATE_HOME/dotfiles/backups/$(date +%Y%m%d-%H%M%S)-$$
+    fi
+    backup_target=$BACKUP_DIR/$relative
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[dry-run] backup $target -> $backup_target"
+        return
+    fi
+    mkdir -p "$(dirname "$backup_target")" || die "cannot create backup directory"
+    mv "$target" "$backup_target" || die "cannot back up $target"
+    log "backed up: $target -> $backup_target"
+}
+
+install_one() {
+    local source_path relative_target target_path mode current_link
+    source_path=$1
+    relative_target=$2
+    mode=$3
+    validate_relative_path "$relative_target"
+    target_path=$HOME/$relative_target
+    [ -e "$source_path" ] || die "manifest source does not exist: $source_path"
+
+    if [ "$mode" = link ] && [ -L "$target_path" ]; then
+        current_link=$(readlink "$target_path" 2>/dev/null || true)
+        if [ "$current_link" = "$source_path" ]; then
+            log "ok: $relative_target"
+            return
+        fi
+    elif [ "$mode" = copy ] && [ ! -L "$target_path" ] && [ -f "$target_path" ] && cmp -s "$source_path" "$target_path"; then
+        log "ok: $relative_target"
+        return
+    fi
+
+    if [ -e "$target_path" ] || [ -L "$target_path" ]; then
+        backup_target "$target_path"
+    fi
+    make_dir "$(dirname "$target_path")"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[dry-run] $mode $relative_target"
+    elif [ "$mode" = link ]; then
+        ln -s "$source_path" "$target_path" || die "cannot link $target_path"
+        log "linked: $relative_target"
+    else
+        cp -p "$source_path" "$target_path" || die "cannot copy $target_path"
+        log "copied: $relative_target"
+    fi
+}
+
+install_all() {
+    local mode scope source_rel target_rel
+    mode=$1
+    log "Installing for $OS on $HOST_NAME (mode: $mode)"
+    write_root_hint
+    write_generated_env
+    ensure_runtime_files
+    while IFS='|' read -r scope source_rel target_rel; do
+        case "$scope" in ""|\#*) continue ;; esac
+        scope_applies "$scope" || continue
+        install_one "$ROOT/$source_rel" "$target_rel" "$mode"
+    done < "$MANIFEST"
+    if [ -n "$BACKUP_DIR" ]; then
+        log "Backup directory: $BACKUP_DIR"
+    fi
+    log "Done. Start a new shell or run: exec \"${SHELL:-zsh}\" -l"
+}
+
+status_all() {
+    local mode scope source_rel target_rel source_path target_path current_link failures
+    mode=$(resolved_mode "${1:-}")
+    failures=0
+    log "Platform: $OS; expected mode: $mode; repository: $ROOT"
+    while IFS='|' read -r scope source_rel target_rel; do
+        case "$scope" in ""|\#*) continue ;; esac
+        scope_applies "$scope" || continue
+        validate_relative_path "$target_rel"
+        source_path=$ROOT/$source_rel
+        target_path=$HOME/$target_rel
+        if [ "$mode" = link ] && [ -L "$target_path" ]; then
+            current_link=$(readlink "$target_path" 2>/dev/null || true)
+            if [ "$current_link" = "$source_path" ]; then
+                printf '[ok]      %s\n' "$target_rel"
+            else
+                printf '[drift]   %s -> %s\n' "$target_rel" "$current_link"
+                failures=$((failures + 1))
+            fi
+        elif [ "$mode" = copy ] && [ ! -L "$target_path" ] && [ -f "$target_path" ] && cmp -s "$source_path" "$target_path"; then
+            printf '[ok]      %s\n' "$target_rel"
+        elif [ ! -e "$target_path" ] && [ ! -L "$target_path" ]; then
+            printf '[missing] %s\n' "$target_rel"
+            failures=$((failures + 1))
+        else
+            printf '[drift]   %s\n' "$target_rel"
+            failures=$((failures + 1))
+        fi
+    done < "$MANIFEST"
+    return "$failures"
+}
+
+uninstall_all() {
+    local mode scope source_rel target_rel source_path target_path current_link removed kept
+    mode=$(resolved_mode "${1:-}")
+    removed=0
+    kept=0
+    while IFS='|' read -r scope source_rel target_rel; do
+        case "$scope" in ""|\#*) continue ;; esac
+        scope_applies "$scope" || continue
+        validate_relative_path "$target_rel"
+        source_path=$ROOT/$source_rel
+        target_path=$HOME/$target_rel
+        current_link=""
+        if [ -L "$target_path" ]; then
+            current_link=$(readlink "$target_path" 2>/dev/null || true)
+        fi
+        if { [ "$mode" = link ] && [ "$current_link" = "$source_path" ]; } || \
+           { [ "$mode" = copy ] && [ ! -L "$target_path" ] && [ -f "$target_path" ] && cmp -s "$source_path" "$target_path"; }; then
+            if [ "$DRY_RUN" -eq 1 ]; then
+                log "[dry-run] remove $target_path"
+            else
+                rm "$target_path" || die "cannot remove $target_path"
+                log "removed: $target_rel"
+            fi
+            removed=$((removed + 1))
+        elif [ -e "$target_path" ] || [ -L "$target_path" ]; then
+            warn "kept modified or unmanaged file: $target_path"
+            kept=$((kept + 1))
+        fi
+    done < "$MANIFEST"
+    log "Removed $removed managed files; kept $kept modified/unmanaged files."
+    log "Device-local files and backups were not removed."
+}
+
+write_device_config() {
+    local tmp
+    mkdir -p "$CONFIG_DIR" || die "cannot create $CONFIG_DIR"
+    tmp=$DEVICE_CONFIG.tmp.$$
+    {
+        printf '# Local device settings; never add this file to the dotfiles repository.\n'
+        printf 'DOTFILES_INSTALL_MODE=%s\n' "$(shell_quote "$DOTFILES_INSTALL_MODE")"
+        if [ -n "$DOTFILES_DEVICE_CONDA_ROOT" ]; then
+            printf 'DOTFILES_DEVICE_CONDA_ROOT=%s\n' "$(shell_quote "$DOTFILES_DEVICE_CONDA_ROOT")"
+        else
+            printf 'DOTFILES_DEVICE_CONDA_ROOT=\n'
+        fi
+    } > "$tmp" || die "cannot write $tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$DEVICE_CONFIG" || die "cannot install $DEVICE_CONFIG"
+    log "updated: $DEVICE_CONFIG"
+}
+
+config_command() {
+    local action key value
+    action=${1:-list}
+    case "$action" in
+        list)
+            printf 'install-mode=%s\n' "$DOTFILES_INSTALL_MODE"
+            printf 'conda-root=%s\n' "$DOTFILES_DEVICE_CONDA_ROOT"
+            ;;
+        set)
+            key=${2:-}
+            value=${3:-}
+            [ -n "$key" ] || die "usage: $PROGRAM config set <install-mode|conda-root> VALUE"
+            case "$key" in
+                install-mode)
+                    case "$value" in auto|link|copy) ;; *) die "install-mode must be auto, link, or copy" ;; esac
+                    DOTFILES_INSTALL_MODE=$value
+                    ;;
+                conda-root)
+                    [ -n "$value" ] || die "conda-root requires a path"
+                    DOTFILES_DEVICE_CONDA_ROOT=$value
+                    ;;
+                *) die "unknown setting: $key" ;;
+            esac
+            write_device_config
+            write_generated_env
+            ;;
+        unset)
+            key=${2:-}
+            case "$key" in
+                conda-root) DOTFILES_DEVICE_CONDA_ROOT="" ;;
+                install-mode) DOTFILES_INSTALL_MODE=auto ;;
+                *) die "unknown setting: $key" ;;
+            esac
+            write_device_config
+            write_generated_env
+            ;;
+        *) die "usage: $PROGRAM config [list|set|unset]" ;;
+    esac
+}
+
+doctor() {
+    local failures command_name private_file
+    failures=0
+    log "Repository : $ROOT"
+    log "Platform   : $OS"
+    log "Host       : $HOST_NAME"
+    log "Home       : $HOME"
+    log "Mode       : $(resolved_mode)"
+    if [ -n "$(detect_conda 2>/dev/null || true)" ]; then
+        log "Conda      : $(detect_conda 2>/dev/null)"
+    else
+        log "Conda      : not found (optional)"
+    fi
+    for command_name in bash git ssh vim; do
+        if command -v "$command_name" >/dev/null 2>&1; then
+            printf '[ok]      command: %s\n' "$command_name"
+        else
+            printf '[optional] command not found: %s\n' "$command_name"
+        fi
+    done
+    if command -v zsh >/dev/null 2>&1; then
+        printf '[ok]      command: zsh\n'
+    else
+        printf '[optional] command not found: zsh\n'
+    fi
+    private_file=$(find "$ROOT" -path "$ROOT/.git" -prune -o -type f \
+        \( -name 'id_rsa*' -o -name 'id_dsa*' -o -name 'id_ecdsa*' \
+        -o -name 'id_ed25519*' -o -name '*.pem' -o -name '*.key' \) \
+        -print 2>/dev/null | sed -n '1p')
+    if [ -n "$private_file" ]; then
+        warn "possible private key inside repository: $private_file"
+        failures=$((failures + 1))
+    else
+        printf '[ok]      no obvious private-key files in repository\n'
+    fi
+    return "$failures"
+}
+
+update_repository() {
+    command -v git >/dev/null 2>&1 || die "git is required for update"
+    git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$ROOT is not a Git worktree"
+    if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+        die "repository has uncommitted changes; commit or stash them before update"
+    fi
+    git -C "$ROOT" pull --ff-only || die "git pull failed"
+    exec "$ROOT/bin/dotfiles" install
+}
+
+usage() {
+    cat <<EOF
+Usage: $PROGRAM COMMAND [OPTIONS]
+
+Commands:
+  install [--mode auto|link|copy] [--dry-run]
+                                  Install or reconcile all managed files
+  status [--mode auto|link|copy]  Report missing or changed files
+  uninstall [--mode ...] [--dry-run]
+                                  Remove only unchanged managed files
+  config [list]                   Show device-local settings
+  config set install-mode MODE    Persist auto, link, or copy
+  config set conda-root PATH      Persist this device's Conda root
+  config unset KEY                Reset a device setting
+  doctor                          Check platform, tools, and secret hygiene
+  update                          Fast-forward Git, then reinstall
+  root                            Print the active repository path
+  help                            Show this help
+
+Examples:
+  ./bin/dotfiles install --dry-run
+  ./bin/dotfiles install
+  dotfiles config set conda-root "\$HOME/miniconda3"
+  dotfiles status
+EOF
+}
+
+parse_mode_and_dry_run() {
+    PARSED_MODE=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --mode)
+                [ "$#" -ge 2 ] || die "--mode requires a value"
+                PARSED_MODE=$2
+                shift 2
+                ;;
+            --mode=*) PARSED_MODE=${1#--mode=}; shift ;;
+            --dry-run|-n) DRY_RUN=1; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    PARSED_MODE=$(resolved_mode "$PARSED_MODE")
+}
+
+COMMAND=${1:-help}
+if [ "$#" -gt 0 ]; then shift; fi
+case "$COMMAND" in
+    install|apply)
+        parse_mode_and_dry_run "$@"
+        install_all "$PARSED_MODE"
+        ;;
+    status)
+        parse_mode_and_dry_run "$@"
+        status_all "$PARSED_MODE"
+        ;;
+    uninstall|unlink)
+        parse_mode_and_dry_run "$@"
+        uninstall_all "$PARSED_MODE"
+        ;;
+    config) config_command "$@" ;;
+    doctor) doctor ;;
+    update) update_repository ;;
+    root) printf '%s\n' "$ROOT" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; die "unknown command: $COMMAND" ;;
+esac

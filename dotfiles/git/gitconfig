@@ -1,0 +1,31 @@
+[init]
+    defaultBranch = main
+[core]
+    excludesFile = ~/.config/git/ignore
+    autocrlf = input
+[color]
+    ui = auto
+[pull]
+    ff = only
+[fetch]
+    prune = true
+    pruneTags = true
+[push]
+    default = simple
+    autoSetupRemote = true
+[rebase]
+    autoStash = true
+[rerere]
+    enabled = true
+    autoUpdate = true
+[diff]
+    algorithm = histogram
+    colorMoved = default
+[merge]
+    conflictStyle = diff3
+[branch]
+    sort = -committerdate
+[tag]
+    sort = version:refname
+[include]
+    path = ~/.config/git/local.conf

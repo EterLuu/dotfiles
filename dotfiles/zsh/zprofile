@@ -1,0 +1,12 @@
+# Login-shell environment.
+dotfiles_generated=${XDG_CONFIG_HOME:-"$HOME/.config"}/dotfiles/generated.sh
+[[ -r "$dotfiles_generated" ]] && source "$dotfiles_generated"
+unset dotfiles_generated
+
+if [[ -n ${DOTFILES_ROOT:-} && -r "$DOTFILES_ROOT/dotfiles/shell/env.sh" ]]; then
+    source "$DOTFILES_ROOT/dotfiles/shell/env.sh"
+fi
+
+dotfiles_local_profile=${XDG_CONFIG_HOME:-"$HOME/.config"}/dotfiles/local.profile
+[[ -r "$dotfiles_local_profile" ]] && source "$dotfiles_local_profile"
+unset dotfiles_local_profile

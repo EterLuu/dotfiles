@@ -1,0 +1,16 @@
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local environment files commonly containing secrets
+.env
+.env.local
+*.local

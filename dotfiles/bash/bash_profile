@@ -1,0 +1,9 @@
+# Bash login shells do not load .bashrc automatically.
+if [ -r "$HOME/.profile" ]; then
+    # shellcheck disable=SC1090
+    . "$HOME/.profile"
+fi
+if [ -r "$HOME/.bashrc" ]; then
+    # shellcheck disable=SC1090
+    . "$HOME/.bashrc"
+fi

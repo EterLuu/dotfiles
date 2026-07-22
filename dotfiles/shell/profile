@@ -1,0 +1,19 @@
+# POSIX login-shell environment.
+dotfiles_generated=${XDG_CONFIG_HOME:-"$HOME/.config"}/dotfiles/generated.sh
+if [ -r "$dotfiles_generated" ]; then
+    # shellcheck disable=SC1090
+    . "$dotfiles_generated"
+fi
+unset dotfiles_generated
+
+if [ -n "${DOTFILES_ROOT:-}" ] && [ -r "$DOTFILES_ROOT/dotfiles/shell/env.sh" ]; then
+    # shellcheck disable=SC1090
+    . "$DOTFILES_ROOT/dotfiles/shell/env.sh"
+fi
+
+dotfiles_local_profile=${XDG_CONFIG_HOME:-"$HOME/.config"}/dotfiles/local.profile
+if [ -r "$dotfiles_local_profile" ]; then
+    # shellcheck disable=SC1090
+    . "$dotfiles_local_profile"
+fi
+unset dotfiles_local_profile

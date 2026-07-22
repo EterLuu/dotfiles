@@ -1,0 +1,79 @@
+" Dependency-free Vim configuration, also usable by Neovim as a fallback.
+set nocompatible
+scriptencoding utf-8
+set encoding=utf-8
+set fileformats=unix,dos,mac
+filetype plugin indent on
+syntax enable
+
+set number
+set ruler
+set showcmd
+set cursorline
+set laststatus=2
+set wildmenu
+set wildmode=longest:full,full
+set ignorecase
+set smartcase
+set incsearch
+set hlsearch
+set nowrap
+set scrolloff=4
+set sidescrolloff=4
+
+set expandtab
+set tabstop=4
+set shiftwidth=4
+set softtabstop=4
+set autoindent
+set smartindent
+set backspace=indent,eol,start
+
+set hidden
+set autoread
+set nobackup
+set nowritebackup
+set updatetime=300
+
+if exists('+mouse')
+  set mouse=a
+endif
+if exists('+signcolumn')
+  set signcolumn=yes
+endif
+if has('clipboard')
+  set clipboard^=unnamedplus
+endif
+
+let s:state_home = exists('$XDG_STATE_HOME') && !empty($XDG_STATE_HOME)
+      \ ? $XDG_STATE_HOME : expand('~/.local/state')
+let s:vim_state = s:state_home . '/vim'
+call mkdir(s:vim_state . '/backup', 'p', 0700)
+call mkdir(s:vim_state . '/swap', 'p', 0700)
+call mkdir(s:vim_state . '/undo', 'p', 0700)
+execute 'set backupdir=' . fnameescape(s:vim_state . '/backup//')
+execute 'set directory=' . fnameescape(s:vim_state . '/swap//')
+if has('persistent_undo')
+  set undofile
+  execute 'set undodir=' . fnameescape(s:vim_state . '/undo//')
+endif
+unlet s:state_home s:vim_state
+
+let mapleader = ' '
+nnoremap <silent> <leader>w :write<CR>
+nnoremap <silent> <leader>q :quit<CR>
+nnoremap <silent> <Esc><Esc> :nohlsearch<CR>
+nnoremap j gj
+nnoremap k gk
+
+augroup dotfiles
+  autocmd!
+  autocmd FileType gitcommit setlocal spell textwidth=72
+  autocmd FileType make setlocal noexpandtab
+  autocmd BufReadPost * if line("'\"") > 1 && line("'\"") <= line('$') |
+        \ execute "normal! g`\"" | endif
+augroup END
+
+if filereadable(expand('~/.vimrc.local'))
+  source ~/.vimrc.local
+endif

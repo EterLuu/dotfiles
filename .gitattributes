@@ -1,0 +1,10 @@
+* text=auto
+
+# These files are consumed by Unix-style programs, including under Git Bash.
+*.sh text eol=lf
+bin/dotfiles text eol=lf
+.dotfiles-manifest text eol=lf
+dotfiles/zsh/* text eol=lf
+dotfiles/bash/* text eol=lf
+dotfiles/shell/* text eol=lf
+dotfiles/ssh/* text eol=lf
