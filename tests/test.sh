@@ -25,11 +25,41 @@ run_dotfiles() {
 TEST_HOME=$TEST_TMP/link-home
 mkdir -p "$TEST_HOME"
 printf 'old vim config\n' > "$TEST_HOME/.vimrc"
+printf 'legacy Bash history entry\n' > "$TEST_HOME/.bash_history"
+mkdir -p "$TEST_HOME/.local/state/dotfiles/copy-base"
+{
+    printf '# previous deployed Bash version\n'
+    cat "$TEST_ROOT/dotfiles/bash/bashrc"
+} > "$TEST_HOME/.local/state/dotfiles/copy-base/.bashrc"
+cp "$TEST_HOME/.local/state/dotfiles/copy-base/.bashrc" "$TEST_HOME/.bashrc"
+printf '\n# installer addition from an old managed copy\n' >> "$TEST_HOME/.bashrc"
+printf '# pre-existing local profile content\n' > "$TEST_HOME/.profile"
+ln -s "$TEST_ROOT/dotfiles/zsh/zshrc" "$TEST_HOME/.zshrc"
 
 run_dotfiles install --mode link >/dev/null
 [ -L "$TEST_HOME/.vimrc" ] || fail '.vimrc was not linked'
 [ -L "$TEST_HOME/.local/bin/dotfiles" ] || fail 'command was not linked'
+[ -d "$TEST_HOME/.local/state/bash" ] || fail 'Bash history directory was not created'
+[ -f "$TEST_HOME/.bashrc" ] && [ ! -L "$TEST_HOME/.bashrc" ] \
+    || fail '.bashrc was not migrated to a local wrapper'
+[ -f "$TEST_HOME/.zshrc" ] && [ ! -L "$TEST_HOME/.zshrc" ] \
+    || fail '.zshrc managed link was not migrated to a local wrapper'
+grep -q '^# dotfiles-local-wrapper:v1:bashrc$' "$TEST_HOME/.bashrc" \
+    || fail '.bashrc wrapper marker is missing'
+grep -q 'installer addition from an old managed copy' "$TEST_HOME/.bashrc" \
+    || fail 'old installer addition was not preserved in the local wrapper'
+if grep -q 'Portable interactive Bash configuration' "$TEST_HOME/.bashrc"; then
+    fail 'old shared Bash source was duplicated inside the local wrapper'
+fi
+grep -q 'pre-existing local profile content' "$TEST_HOME/.profile" \
+    || fail 'pre-existing profile content was not preserved'
 run_dotfiles status --mode link >/dev/null || fail 'link status reported drift'
+printf '\n# third-party installer addition stays local\n' >> "$TEST_HOME/.zshrc"
+run_dotfiles status --mode link >/dev/null \
+    || fail 'a local shell-wrapper edit was treated as managed drift'
+if grep -q 'third-party installer addition stays local' "$TEST_ROOT/dotfiles/zsh/zshrc"; then
+    fail 'a third-party shell addition leaked into the repository'
+fi
 
 DANGLING_REPO=$TEST_TMP/dangling-repository
 DANGLING_HOME=$TEST_TMP/dangling-home
@@ -49,6 +79,26 @@ HOME=$TEST_HOME XDG_CONFIG_HOME=$TEST_HOME/.config XDG_STATE_HOME=$TEST_HOME/.lo
 HOME=$TEST_HOME XDG_CONFIG_HOME=$TEST_HOME/.config XDG_STATE_HOME=$TEST_HOME/.local/state \
     bash --noprofile --norc -c '. "$HOME/.bashrc"; [ "$DOTFILES_ROOT" = "$1" ]' bash "$TEST_ROOT" \
     || fail 'Bash configuration did not load the generated repository root'
+mkdir -p "$TEST_HOME/.config/nvm"
+printf '%s\n' \
+    'export DOTFILES_TEST_NVM_LOADED=1' \
+    'nvm() { :; }' > "$TEST_HOME/.config/nvm/nvm.sh"
+HOME=$TEST_HOME XDG_CONFIG_HOME=$TEST_HOME/.config XDG_STATE_HOME=$TEST_HOME/.local/state NVM_DIR= \
+    bash --noprofile --rcfile "$TEST_HOME/.bashrc" -ic \
+    'type nvm >/dev/null && [ "$DOTFILES_TEST_NVM_LOADED" = 1 ] &&
+     history -s "persisted Bash history entry" && history -a' >/dev/null 2>&1 \
+    || fail 'interactive Bash history or NVM setup failed'
+grep -q 'legacy Bash history entry' "$TEST_HOME/.local/state/bash/history" \
+    || fail 'legacy Bash history was not migrated'
+grep -q 'persisted Bash history entry' "$TEST_HOME/.local/state/bash/history" \
+    || fail 'Bash history was not persisted'
+HOME=$TEST_HOME XDG_CONFIG_HOME=$TEST_HOME/.config XDG_STATE_HOME=$TEST_HOME/.local/state NVM_DIR= \
+    bash --noprofile --rcfile "$TEST_HOME/.bashrc" -ic \
+    'history | grep -q "persisted Bash history entry"' >/dev/null 2>&1 \
+    || fail 'a new Bash shell did not reload the persisted history'
+if rg -q '^[[:space:]]*IdentitiesOnly[[:space:]]+yes' "$TEST_ROOT/dotfiles/ssh/shared.conf"; then
+    fail 'shared SSH defaults still force IdentitiesOnly yes'
+fi
 
 FAKE_REPOSITORY=$TEST_TMP/stale-repository
 mkdir -p "$FAKE_REPOSITORY"
@@ -60,6 +110,15 @@ run_dotfiles install --mode link >/dev/null
 BACKED_UP=$(find "$TEST_HOME/.local/state/dotfiles/backups" -type f -name .vimrc -print | sed -n '1p')
 [ -n "$BACKED_UP" ] || fail 'existing file was not backed up'
 grep -q 'old vim config' "$BACKED_UP" || fail 'backup content changed'
+BACKED_UP_BASHRC=$(find "$TEST_HOME/.local/state/dotfiles/backups" -type f -name .bashrc -print | sed -n '1p')
+[ -n "$BACKED_UP_BASHRC" ] || fail 'old Bash entry point was not backed up'
+BACKED_UP_ZSHRC=$(find "$TEST_HOME/.local/state/dotfiles/backups" -type l -name .zshrc -print | sed -n '1p')
+[ -n "$BACKED_UP_ZSHRC" ] || fail 'old Zsh managed link was not backed up'
+BACKED_UP_ZSH_CONTENT=$(find "$TEST_HOME/.local/state/dotfiles/backups" -type f \
+    -name '.zshrc.managed-content' -print | sed -n '1p')
+[ -n "$BACKED_UP_ZSH_CONTENT" ] || fail 'linked Zsh content was not snapshotted'
+cmp -s "$BACKED_UP_ZSH_CONTENT" "$TEST_ROOT/dotfiles/zsh/zshrc" \
+    || fail 'linked Zsh content backup changed'
 [ -f "$TEST_HOME/.config/dotfiles/local.zsh" ] || fail 'local zsh file missing'
 [ ! -L "$TEST_HOME/.config/dotfiles/local.zsh" ] || fail 'local zsh file must not be linked'
 
@@ -87,18 +146,28 @@ run_dotfiles uninstall --mode link >/dev/null
 TEST_HOME=$TEST_TMP/copy-home
 mkdir -p "$TEST_HOME"
 run_dotfiles install --mode copy >/dev/null
-[ -f "$TEST_HOME/.bashrc" ] || fail '.bashrc was not copied'
-[ ! -L "$TEST_HOME/.bashrc" ] || fail '.bashrc should be a regular copy'
+[ -f "$TEST_HOME/.bashrc" ] || fail '.bashrc local wrapper was not created'
+[ ! -L "$TEST_HOME/.bashrc" ] || fail '.bashrc local wrapper must be a regular file'
+sed '1s/v1/v0/' "$TEST_HOME/.bashrc" > "$TEST_HOME/.bashrc.old-wrapper"
+mv "$TEST_HOME/.bashrc.old-wrapper" "$TEST_HOME/.bashrc"
+printf '\n# third-party suffix on an older wrapper\n' >> "$TEST_HOME/.bashrc"
+run_dotfiles install --mode copy >/dev/null
+grep -q '^# dotfiles-local-wrapper:v1:bashrc$' "$TEST_HOME/.bashrc" \
+    || fail 'an older local wrapper was not upgraded'
+grep -q 'third-party suffix on an older wrapper' "$TEST_HOME/.bashrc" \
+    || fail 'wrapper upgrade did not preserve the third-party suffix'
+if grep -q '^# dotfiles-local-wrapper:v0:bashrc$' "$TEST_HOME/.bashrc"; then
+    fail 'wrapper upgrade nested the old wrapper'
+fi
 run_dotfiles status --mode copy >/dev/null || fail 'copy status reported drift'
 HOME=$TEST_HOME XDG_CONFIG_HOME=$TEST_HOME/.config XDG_STATE_HOME=$TEST_HOME/.local/state \
     "$TEST_HOME/.local/bin/dotfiles" status --mode copy >/dev/null \
     || fail 'copied command could not recover the repository root'
 printf '\n# local accidental edit\n' >> "$TEST_HOME/.bashrc"
-if run_dotfiles status --mode copy >/dev/null; then
-    fail 'copy drift was not detected'
-fi
+run_dotfiles status --mode copy >/dev/null \
+    || fail 'local wrapper edit was incorrectly treated as copy drift'
 run_dotfiles uninstall --mode copy >/dev/null 2>&1
-[ -f "$TEST_HOME/.bashrc" ] || fail 'modified copied file should be kept on uninstall'
+[ -f "$TEST_HOME/.bashrc" ] || fail 'local wrapper should be kept on uninstall'
 [ -f "$TEST_HOME/.config/dotfiles/local.bash" ] || fail 'copy uninstall removed local config'
 
 # Exercise save/sync in an isolated repository with a local bare remote.
@@ -128,6 +197,90 @@ run_saved_dotfiles() {
 }
 
 run_saved_dotfiles install --mode copy >/dev/null
+printf '\n# simulated conda init block remains device-local\n' >> "$SAVE_HOME/.zshrc"
+run_saved_dotfiles save --mode copy -m 'must not capture local wrapper' >/dev/null
+grep -q 'simulated conda init block remains device-local' "$SAVE_HOME/.zshrc" \
+    || fail 'save removed a third-party local shell addition'
+if grep -q 'simulated conda init block remains device-local' "$SAVE_REPO/dotfiles/zsh/zshrc"; then
+    fail 'save captured a local shell wrapper into the repository'
+fi
+[ -z "$(git -C "$SAVE_REPO" status --porcelain)" ] \
+    || fail 'local shell wrapper edit made the repository dirty'
+
+# A config mutation writes device.conf before generated.sh. Force the second
+# atomic rename to fail and verify that both files return to their old state.
+CONFIG_GENERATED_SNAPSHOT=$TEST_TMP/generated-before-config-failure
+CONFIG_FAIL_BIN=$TEST_TMP/config-fail-bin
+CONFIG_FAIL_MARKER=$TEST_TMP/config-mv-failed
+CONFIG_REAL_MV=$(command -v mv)
+cp "$SAVE_HOME/.config/dotfiles/generated.sh" "$CONFIG_GENERATED_SNAPSHOT"
+mkdir -p "$CONFIG_FAIL_BIN"
+printf '%s\n' \
+    '#!/usr/bin/env sh' \
+    'for dotfiles_last_arg do :; done' \
+    'if [ "$dotfiles_last_arg" = "$DOTFILES_TEST_FAIL_MV_TARGET" ] &&' \
+    '   [ ! -e "$DOTFILES_TEST_FAIL_MV_MARKER" ]; then' \
+    '    : > "$DOTFILES_TEST_FAIL_MV_MARKER"' \
+    '    exit 1' \
+    'fi' \
+    'exec "$DOTFILES_TEST_REAL_MV" "$@"' > "$CONFIG_FAIL_BIN/mv"
+chmod +x "$CONFIG_FAIL_BIN/mv"
+if PATH=$CONFIG_FAIL_BIN:$PATH \
+    DOTFILES_TEST_FAIL_MV_TARGET=$SAVE_HOME/.config/dotfiles/generated.sh \
+    DOTFILES_TEST_FAIL_MV_MARKER=$CONFIG_FAIL_MARKER \
+    DOTFILES_TEST_REAL_MV=$CONFIG_REAL_MV \
+    run_saved_dotfiles config set conda-root "$SAVE_HOME/failing-conda" >/dev/null 2>&1; then
+    fail 'config set unexpectedly succeeded after generated.sh rename failure'
+fi
+[ ! -e "$SAVE_HOME/.config/dotfiles/device.conf" ] \
+    || fail 'failed config set did not remove the newly created device.conf'
+cmp -s "$SAVE_HOME/.config/dotfiles/generated.sh" "$CONFIG_GENERATED_SNAPSHOT" \
+    || fail 'failed config set did not restore generated.sh'
+if find "$SAVE_HOME/.config/dotfiles" -name 'generated.sh.tmp.*' -print \
+    | sed -n '1p' | grep -q .; then
+    fail 'failed config set left a generated.sh temporary file'
+fi
+
+# A direct install is also atomic: a late missing source must roll back files
+# already deployed earlier in the manifest.
+INSTALL_MANIFEST_SNAPSHOT=$TEST_TMP/install-manifest-before-failure
+INSTALL_WRAPPER_SNAPSHOT=$TEST_TMP/install-wrapper-before-failure
+cp "$SAVE_REPO/.dotfiles-manifest" "$INSTALL_MANIFEST_SNAPSHOT"
+cp "$SAVE_HOME/.zshrc" "$INSTALL_WRAPPER_SNAPSHOT"
+printf 'pre-install local vim content\n' > "$SAVE_HOME/.vimrc"
+rm "$SAVE_HOME/.inputrc"
+printf 'all|dotfiles/missing-for-install.conf|.missing-for-install.conf\n' \
+    >> "$SAVE_REPO/.dotfiles-manifest"
+if run_saved_dotfiles install --mode copy >/dev/null 2>&1; then
+    fail 'install unexpectedly succeeded with a missing manifest source'
+fi
+grep -q 'pre-install local vim content' "$SAVE_HOME/.vimrc" \
+    || fail 'failed install did not restore a replaced HOME target'
+[ ! -e "$SAVE_HOME/.inputrc" ] \
+    || fail 'failed install did not restore a pre-install missing target'
+cmp -s "$SAVE_HOME/.zshrc" "$INSTALL_WRAPPER_SNAPSHOT" \
+    || fail 'failed install changed a local shell wrapper'
+grep -q 'missing-for-install' "$SAVE_REPO/.dotfiles-manifest" \
+    || fail 'failed install did not preserve the pre-install repository edit'
+if find "$SAVE_HOME/.local/state/dotfiles/transactions" \
+    \( -name ACTIVE -o -name IN_DOUBT \) -print 2>/dev/null | sed -n '1p' | grep -q .; then
+    fail 'failed install left a recoverable transaction after successful rollback'
+fi
+if find "$SAVE_HOME/.local/state/dotfiles/backups" -maxdepth 1 \
+    -type d -name 'transaction-*' -print 2>/dev/null | sed -n '1p' | grep -q .; then
+    fail 'failed install left its transaction backup behind'
+fi
+cp "$INSTALL_MANIFEST_SNAPSHOT" "$SAVE_REPO/.dotfiles-manifest"
+run_saved_dotfiles install --mode copy >/dev/null
+
+# Refuse a transaction that could not restore an out-of-scope repository edit.
+printf '\nlocal license edit outside transaction scope\n' >> "$SAVE_REPO/LICENSE"
+if run_saved_dotfiles install --mode copy >/dev/null 2>&1; then
+    fail 'install accepted an out-of-scope repository edit'
+fi
+grep -q 'local license edit outside transaction scope' "$SAVE_REPO/LICENSE" \
+    || fail 'install preflight lost an out-of-scope repository edit'
+git -C "$SAVE_REPO" restore -- LICENSE
 
 TRANSACTION_LOCK=$SAVE_HOME/.local/state/dotfiles/transaction.lock
 mkdir "$TRANSACTION_LOCK"
@@ -142,6 +295,7 @@ rm -rf "$TRANSACTION_LOCK"
 # state has been restored.
 ACTIVE_HEAD=$(git -C "$SAVE_REPO" rev-parse HEAD)
 printf '\n# survives forced interruption in HOME\n' >> "$SAVE_HOME/.profile"
+printf '\n# creates the forced-interruption commit\n' >> "$SAVE_HOME/.inputrc"
 ACTIVE_HOME_CHECKPOINT=$TEST_TMP/active-home-checkpoint
 cp -p "$SAVE_HOME/.profile" "$ACTIVE_HOME_CHECKPOINT"
 printf '%s\n' \
@@ -337,10 +491,12 @@ cmp -s "$SAVE_HOME/.local/state/dotfiles/copy-base/.inputrc" "$REBASE_BASELINE_S
 git -C "$SAVE_REPO" pull -q --ff-only
 run_saved_dotfiles install --mode copy >/dev/null
 
-printf '\n# changed in repository\n' >> "$SAVE_REPO/dotfiles/bash/bashrc"
+printf '\nexport DOTFILES_TEST_REPOSITORY_UPDATE=1\n' >> "$SAVE_REPO/dotfiles/bash/bashrc"
 run_saved_dotfiles save --mode copy -m 'repository-side update' >/dev/null
-grep -q 'changed in repository' "$SAVE_HOME/.bashrc" \
-    || fail 'save overwrote or failed to install a repository-side update'
+HOME=$SAVE_HOME XDG_CONFIG_HOME=$SAVE_HOME/.config XDG_STATE_HOME=$SAVE_HOME/.local/state NVM_DIR= \
+    bash --noprofile --rcfile "$SAVE_HOME/.bashrc" -ic \
+    '[ "$DOTFILES_TEST_REPOSITORY_UPDATE" = 1 ]' >/dev/null 2>&1 \
+    || fail 'local wrapper did not load a repository-side Bash update'
 
 printf '%s\n' '-----BEGIN OPENSSH PRIVATE KEY-----' 'not-a-real-key' \
     > "$SAVE_REPO/dotfiles/ssh/leak.conf"
@@ -350,13 +506,28 @@ fi
 git -C "$SAVE_REPO" reset -q HEAD -- dotfiles/ssh/leak.conf
 rm "$SAVE_REPO/dotfiles/ssh/leak.conf"
 
-# update must roll back both the fast-forward and a partially applied install.
+# update must deploy with the newly fetched manager, not the old functions
+# already loaded by the parent process.
 run_saved_dotfiles sync --mode copy -m 'prepare update rollback test' >/dev/null 2>&1
 UPDATE_OTHER=$TEST_TMP/update-other-clone
 git clone -q "$SAVE_REMOTE" "$UPDATE_OTHER"
 git -C "$UPDATE_OTHER" config user.name 'Dotfiles Update Test'
 git -C "$UPDATE_OTHER" config user.email 'dotfiles-update@example.invalid'
 git -C "$UPDATE_OTHER" config commit.gpgSign false
+sed 's/# Generated by dotfiles install. Do not edit./# Generated by self-updated dotfiles. Do not edit./' \
+    "$UPDATE_OTHER/bin/dotfiles" > "$UPDATE_OTHER/bin/dotfiles.new"
+mv "$UPDATE_OTHER/bin/dotfiles.new" "$UPDATE_OTHER/bin/dotfiles"
+chmod +x "$UPDATE_OTHER/bin/dotfiles"
+git -C "$UPDATE_OTHER" add bin/dotfiles
+git -C "$UPDATE_OTHER" commit -q -m 'change updated manager deployment behavior'
+git -C "$UPDATE_OTHER" push -q
+run_saved_dotfiles update >/dev/null 2>&1
+grep -q '^# Generated by self-updated dotfiles. Do not edit.$' \
+    "$SAVE_HOME/.config/dotfiles/generated.sh" \
+    || fail 'update deployed with the old in-memory manager'
+
+# update must also roll back both the fast-forward and a partially applied
+# install performed by that newly fetched manager.
 printf 'all|dotfiles/missing-for-update.conf|.config/dotfiles/missing-for-update.conf\n' \
     >> "$UPDATE_OTHER/.dotfiles-manifest"
 git -C "$UPDATE_OTHER" add .dotfiles-manifest
@@ -389,14 +560,14 @@ if find "$SAVE_HOME/.local/state/dotfiles/transactions" \
     fail 'failed update left a recoverable transaction after successful rollback'
 fi
 
-printf '\n# repository conflict side\n' >> "$SAVE_REPO/dotfiles/bash/bashrc"
-printf '\n# home conflict side\n' >> "$SAVE_HOME/.bashrc"
+printf '\n# repository conflict side\n' >> "$SAVE_REPO/dotfiles/tmux/tmux.conf"
+printf '\n# home conflict side\n' >> "$SAVE_HOME/.tmux.conf"
 if run_saved_dotfiles save --mode copy -m 'must conflict' >/dev/null 2>&1; then
     fail 'save did not reject a two-sided copy conflict'
 fi
-grep -q 'repository conflict side' "$SAVE_REPO/dotfiles/bash/bashrc" \
+grep -q 'repository conflict side' "$SAVE_REPO/dotfiles/tmux/tmux.conf" \
     || fail 'conflict rollback lost the original repository-side edit'
-grep -q 'home conflict side' "$SAVE_HOME/.bashrc" \
+grep -q 'home conflict side' "$SAVE_HOME/.tmux.conf" \
     || fail 'conflict rollback lost the original HOME-side edit'
 [ -z "$(git -C "$SAVE_REPO" diff --cached --name-only)" ] \
     || fail 'conflict rollback left staged changes behind'

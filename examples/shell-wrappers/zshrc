@@ -1,0 +1,12 @@
+# dotfiles-local-wrapper:v1:zshrc
+# This entry point stays local so third-party installers can safely edit it.
+dotfiles_wrapper_generated=${XDG_CONFIG_HOME:-"$HOME/.config"}/dotfiles/generated.sh
+[[ -r "$dotfiles_wrapper_generated" ]] && source "$dotfiles_wrapper_generated"
+unset dotfiles_wrapper_generated
+
+if [[ -n ${DOTFILES_ROOT:-} && -r "$DOTFILES_ROOT/dotfiles/zsh/zshrc" ]]; then
+    source "$DOTFILES_ROOT/dotfiles/zsh/zshrc"
+else
+    print -u2 'warning: dotfiles Zsh configuration was not found; run dotfiles install'
+fi
+# dotfiles-local-wrapper-end:v1:zshrc

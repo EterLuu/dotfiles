@@ -40,3 +40,39 @@ if [ -n "${DOTFILES_ROOT:-}" ] && [ -n "${DOTFILES_HOST:-}" ]; then
     fi
     unset dotfiles_host_shell
 fi
+
+# NVM is installed in different locations by different installers. Keep the
+# discovery shared, but call it after local.bash/local.zsh so a device can set
+# an explicit NVM_DIR without changing tracked files.
+dotfiles_load_nvm() {
+    if command -v nvm >/dev/null 2>&1; then
+        return 0
+    fi
+
+    dotfiles_nvm_dir=""
+    if [ -n "${NVM_DIR:-}" ] && [ -s "$NVM_DIR/nvm.sh" ]; then
+        dotfiles_nvm_dir=$NVM_DIR
+    else
+        for dotfiles_nvm_candidate in \
+            "${XDG_CONFIG_HOME:-"$HOME/.config"}/nvm" \
+            "$HOME/.nvm"; do
+            if [ -s "$dotfiles_nvm_candidate/nvm.sh" ]; then
+                dotfiles_nvm_dir=$dotfiles_nvm_candidate
+                break
+            fi
+        done
+        unset dotfiles_nvm_candidate
+    fi
+
+    if [ -n "$dotfiles_nvm_dir" ]; then
+        NVM_DIR=$dotfiles_nvm_dir
+        export NVM_DIR
+        # shellcheck disable=SC1090
+        . "$NVM_DIR/nvm.sh"
+        if [ -n "${BASH_VERSION:-}" ] && [ -s "$NVM_DIR/bash_completion" ]; then
+            # shellcheck disable=SC1090
+            . "$NVM_DIR/bash_completion"
+        fi
+    fi
+    unset dotfiles_nvm_dir
+}

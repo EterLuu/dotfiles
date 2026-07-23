@@ -1,11 +1,6 @@
 # platform|repository source|path relative to $HOME
 # Platforms: all, unix, macos, linux, wsl, windows (comma separated).
 all|bin/dotfiles|.local/bin/dotfiles
-all|dotfiles/zsh/zshrc|.zshrc
-all|dotfiles/zsh/zprofile|.zprofile
-all|dotfiles/bash/bashrc|.bashrc
-all|dotfiles/bash/bash_profile|.bash_profile
-all|dotfiles/shell/profile|.profile
 all|dotfiles/vim/vimrc|.vimrc
 all|dotfiles/git/gitconfig|.gitconfig
 all|dotfiles/git/ignore|.config/git/ignore

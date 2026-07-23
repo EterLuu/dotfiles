@@ -4,6 +4,9 @@ generated.sh
 local.bash
 local.zsh
 local.profile
+!examples/local.bash
+!examples/local.zsh
+!examples/local.profile
 *.pem
 *.key
 id_rsa*

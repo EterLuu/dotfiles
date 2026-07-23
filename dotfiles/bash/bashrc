@@ -14,11 +14,36 @@ fi
 
 case $- in *i*) ;; *) return ;; esac
 
-HISTFILE=${XDG_STATE_HOME:-"$HOME/.local/state"}/bash/history
+dotfiles_bash_state=${XDG_STATE_HOME:-"$HOME/.local/state"}/bash
+dotfiles_bash_history=$dotfiles_bash_state/history
+dotfiles_bash_legacy_history=$HOME/.bash_history
+if mkdir -p "$dotfiles_bash_state" 2>/dev/null; then
+    chmod 700 "$dotfiles_bash_state" 2>/dev/null || true
+    if [ ! -e "$dotfiles_bash_history" ]; then
+        if [ -f "$dotfiles_bash_legacy_history" ]; then
+            cp -p "$dotfiles_bash_legacy_history" "$dotfiles_bash_history" 2>/dev/null || true
+        else
+            : > "$dotfiles_bash_history" 2>/dev/null || true
+        fi
+    fi
+fi
+if [ -f "$dotfiles_bash_history" ] && [ -w "$dotfiles_bash_history" ]; then
+    HISTFILE=$dotfiles_bash_history
+    chmod 600 "$HISTFILE" 2>/dev/null || true
+else
+    HISTFILE=$dotfiles_bash_legacy_history
+    printf 'warning: cannot use XDG Bash history; falling back to %s\n' "$HISTFILE" >&2
+fi
+unset dotfiles_bash_state dotfiles_bash_history dotfiles_bash_legacy_history
 HISTSIZE=50000
 HISTFILESIZE=50000
 HISTCONTROL=ignoreboth:erasedups
 shopt -s histappend checkwinsize cmdhist
+# Bash reads its default history before .bashrc. After moving HISTFILE to the
+# XDG state directory, replace that initial list with the selected file so a
+# new shell sees commands saved by the previous shell.
+history -c
+history -r "$HISTFILE" 2>/dev/null || true
 
 if [ -r /usr/share/bash-completion/bash_completion ]; then
     # shellcheck disable=SC1091
@@ -57,3 +82,7 @@ if [ -r "$dotfiles_local_bash" ]; then
     . "$dotfiles_local_bash"
 fi
 unset dotfiles_local_bash
+
+if command -v dotfiles_load_nvm >/dev/null 2>&1; then
+    dotfiles_load_nvm
+fi

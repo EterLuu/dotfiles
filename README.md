@@ -4,6 +4,10 @@
 命令负责部署，实际内容由 Git 同步；适用于 macOS、Linux、WSL，以及 Git
 Bash/MSYS2 下的原生 Windows。
 
+管理命令要求 Bash 3.2+、Git 和系统常见的 POSIX 工具；SSH、Vim、Zsh、NVM 与
+Conda 都是按需使用的可选软件。`dotfiles doctor` 会把 Bash/Git 缺失报告为必需项，
+其他工具缺失报告为可选项。
+
 它解决三类数据，并刻意不把它们混在一起：
 
 - **共享配置**：Zsh、Bash、Vim、Git、tmux、SSH 的安全默认值，提交到本仓库；
@@ -23,7 +27,8 @@ Git 仓库（可同步）
           │ install
           ▼
 用户 HOME
-├── ~/.zshrc 等              符号链接，Windows 默认是普通副本
+├── ~/.zshrc、~/.bashrc 等   本机 wrapper，加载仓库中的共享 Shell 配置
+├── 其他 manifest 文件       Unix 默认符号链接，Windows 默认普通副本
 ├── ~/.config/dotfiles/      设备路径、生成环境和本地覆盖
 ├── ~/.config/git/local.conf Git 身份等私有信息
 └── ~/.ssh/config.local      私有主机、密钥路径和跳板机
@@ -47,13 +52,21 @@ exec "${SHELL:-zsh}" -l
 ```
 
 安装器会先把冲突文件移到
-`~/.local/state/dotfiles/backups/<时间>-<进程号>/`，再部署新配置。重复执行
+`~/.local/state/dotfiles/backups/transaction-<时间>-<进程号>/`，再部署新配置。重复执行
 `dotfiles install` 是幂等的。安装后命令位于 `~/.local/bin/dotfiles`，而该目录
-也会加入 `PATH`。
+也会加入 `PATH`。非 dry-run 安装在本地事务中执行；中途任一源文件缺失、复制或
+链接失败时，会恢复安装前的 HOME、生成文件、目录权限和仓库状态。只有成功安装产生
+的备份会保留。
+
+`.bashrc`、`.bash_profile`、`.profile`、`.zshrc` 和 `.zprofile` 是一个重要例外：
+它们始终是本机普通文件，不是指向仓库的链接，也不会被复制模式回收到 Git。wrapper
+先加载仓库内的共享配置，之后允许 NVM、`conda init`、SDK 安装器等追加本机内容。
+因此第三方安装器只会修改本机 wrapper，不会沿符号链接修改仓库中的共享配置。
 
 建议先编辑以下仅存在于本机的文件：
 
 ```text
+~/.zshrc、~/.bashrc 等         第三方安装器自动维护的本机 Shell 入口
 ~/.config/git/local.conf       Git 姓名、邮箱和签名密钥
 ~/.ssh/config.local            SSH 主机、User、IdentityFile、ProxyJump
 ~/.config/dotfiles/local.zsh   仅 Zsh 使用的别名或变量
@@ -66,7 +79,7 @@ exec "${SHELL:-zsh}" -l
 ```bash
 dotfiles install                     # 安装或修复配置
 dotfiles install --dry-run           # 只显示动作
-dotfiles status                      # 检查缺失、错误链接或副本漂移
+dotfiles status                      # 检查本机 wrapper、错误链接或副本漂移
 dotfiles doctor                      # 检查依赖、平台和疑似私钥
 dotfiles update                      # 事务式 fast-forward 并重新安装
 dotfiles save -m "update vim"        # 收集副本、创建本地 commit 并重新安装
@@ -77,8 +90,13 @@ dotfiles root                        # 显示当前仓库位置
 dotfiles config list                 # 显示设备设置
 ```
 
-`uninstall` 不删除设备本地配置和备份。复制模式下，如果 HOME 中的副本被修改，
-它也会保留该文件并提示，避免误删。
+`uninstall` 不删除 Shell wrapper、设备本地配置和备份。复制模式下，如果 HOME
+中的副本被修改，它也会保留该文件并提示，避免误删。
+
+`install`、`uninstall` 和 `config set/unset` 也使用与同步命令相同的事务锁和本地
+回退机制。除只读命令以及安装/卸载的 `--dry-run` 外，事务要求仓库至少已有一个
+commit、暂存区为空；未提交文件必须位于本项目允许快照的范围内。`update` 更严格，
+要求整个仓库干净。这些限制用于保证回退不会清除事务快照之外的用户修改。
 
 `commit` 是 `save` 的别名，`publish` 是 `sync` 的别名，`save --push` 也等价于
 `sync`。提交消息既可以写成 `-m "message"`，也可以直接作为最后一个位置参数；
@@ -88,6 +106,9 @@ dotfiles config list                 # 显示设备设置
 
 macOS、Linux 和 WSL 默认使用绝对符号链接；原生 Windows 的 Git Bash/MSYS2
 默认使用复制，避免 Windows 开发者模式、权限和 Git symlink 配置造成的不一致。
+这一模式只作用于 `.dotfiles-manifest` 中的普通托管文件；五个 Shell 入口始终使用
+本机 wrapper。共享 Shell 设置应直接编辑仓库中的 `dotfiles/bash/`、`dotfiles/zsh/`
+或 `dotfiles/shell/`，不要通过 HOME wrapper 回收。
 可以按设备永久覆盖：
 
 ```bash
@@ -109,7 +130,29 @@ dotfiles save --mode copy -m "update copied config"
 冲突。`status` 会发现 HOME 副本与仓库的差异。Windows 上若需完整 Unix 行为，
 优先选择 WSL。此仓库不自动管理 PowerShell Profile。
 
-## Conda、Miniconda 与设备路径
+## NVM、Conda 与设备路径
+
+### NVM
+
+交互式 Bash 和 Zsh 会按以下顺序查找 NVM：
+
+1. 当前设备显式设置的 `NVM_DIR`；
+2. `${XDG_CONFIG_HOME:-$HOME/.config}/nvm`；
+3. `~/.nvm`。
+
+找到 `nvm.sh` 后会加载 NVM；Bash 下还会加载可用的补全文件。因此 NVM 安装在
+`~/.nvm` 或 `~/.config/nvm` 时，无需把初始化块提交到共享 `.bashrc/.zshrc`。若某台
+设备使用其他路径，把它写入对应本机配置，例如：
+
+```sh
+# ~/.config/dotfiles/local.zsh 或 local.bash
+export NVM_DIR="$HOME/apps/nvm"
+```
+
+NVM 安装脚本如果仍向 `~/.zshrc` 或 `~/.bashrc` 追加初始化代码，修改的是本机
+wrapper；代码会生效，但不会被 `dotfiles save/sync` 提交。
+
+### Conda、Miniconda
 
 安装时会依次检查当前 `CONDA_EXE`、`PATH`，以及常见的 Miniconda、Anaconda、
 Miniforge 和 Mambaforge 目录。检测结果写入本机的
@@ -120,6 +163,14 @@ Miniforge 和 Mambaforge 目录。检测结果写入本机的
 
 ```bash
 dotfiles config set conda-root "$HOME/apps/miniconda3"
+```
+
+如果先安装 dotfiles、后安装 Miniconda，安装完成后执行同一命令（把路径换成实际
+安装目录），再开启新 Shell 即可，不需要额外运行 `conda init`：
+
+```bash
+dotfiles config set conda-root "$HOME/miniconda3"
+exec "${SHELL:-zsh}" -l
 ```
 
 含空格的路径也受支持。Windows Git Bash 应使用它能识别的路径（例如
@@ -149,6 +200,7 @@ dotfiles config unset conda-root
 | 某台主机的公开交互配置 | `profiles/hosts/<短主机名>/shell.sh` | 是 | 不含机密的主机别名、工作目录函数 |
 | 当前设备的登录环境 | `~/.config/dotfiles/local.profile` | 否 | 私有 SDK 路径、需要由子进程继承的变量 |
 | 当前设备的 Bash/Zsh 配置 | `local.bash` / `local.zsh` | 否 | 私有 alias、代理和仅该 Shell 使用的命令 |
+| 第三方安装器维护的 Shell 入口 | `~/.bashrc` / `~/.zshrc` 等 wrapper | 否 | NVM、Conda、SDK 安装器自动追加的初始化块 |
 | Git 身份 | `~/.config/git/local.conf` | 否 | 姓名、邮箱、签名密钥 |
 | SSH 主机 | `~/.ssh/config.local` | 否 | Host、用户名、密钥路径、ProxyJump |
 
@@ -169,20 +221,24 @@ generated.sh
 交互式 Shell 的加载顺序是：
 
 ```text
-generated.sh
+本机 ~/.bashrc 或 ~/.zshrc wrapper
+→ generated.sh
 → dotfiles/shell/env.sh
 → profiles/<平台>/env.sh
 → dotfiles/shell/interactive.sh
 → profiles/<平台>/shell.sh
 → profiles/hosts/<短主机名>/shell.sh
 → local.bash 或 local.zsh
+→ NVM 自动发现
+→ 第三方安装器追加在 wrapper 末尾的本机代码
 ```
 
 因此应遵守以下规则：
 
 - `env.sh` 必须可重复加载，不输出文字、不等待输入、不启动后台进程；
 - alias、交互函数和需要启动进程的配置放在 `shell.sh`；
-- 本机覆盖最后加载，可以覆盖共享 alias 或变量；
+- `local.bash/local.zsh` 在共享配置之后加载，可以覆盖共享 alias 或变量；
+- wrapper 主要留给第三方安装器自动维护；手写设备配置仍优先放在 `local.*`；
 - `local.profile` 只保证由登录 Shell 读取。非登录 Shell 通常继承登录环境；如果某个
   启动器没有继承它，应把设置放入对应的 `local.bash`/`local.zsh`，或从二者共同
   source 一个设备本地脚本。
@@ -194,6 +250,28 @@ printf 'platform=%s host=%s\n' "$DOTFILES_OS" "$DOTFILES_HOST"
 ```
 
 如果变量为空或平台不正确，先重新执行 `dotfiles install` 生成当前设备环境。
+
+### Shell 历史与终端字体
+
+Bash 和 Zsh 的历史分别保存在：
+
+```text
+~/.local/state/bash/history
+~/.local/state/zsh/history
+```
+
+首次启动新配置时，如果新历史文件尚不存在，会复制原来的 `~/.bash_history` 或
+`~/.zsh_history`，不会删除原文件。历史目录或文件不可写时，Shell 会显示警告并退回
+原路径。历史文件权限会收紧为 `600`，目录权限为 `700`。Bash 在 `.bashrc` 中切换
+`HISTFILE` 后会显式重新读取该文件，因此上一个 Shell 写入的命令能被下一个 Shell
+看到，而不只是存在于磁盘上。
+
+本仓库不管理终端字体或字号；Shell 提示符只设置颜色。tmux 和 Vim 的终端模式也不会
+改变终端模拟器的字体大小。如果安装后视觉上变大，应检查终端自身的缩放和 profile
+外观设置。Windows Terminal 默认可用 `Ctrl+0` 重置缩放，也可以在
+[Settings → Profiles → Appearance](https://learn.microsoft.com/en-us/windows/terminal/customize-settings/profile-appearance)
+中核对 Font size；若修改过快捷键，以实际绑定为准。快捷键动作可参考
+[Windows Terminal Actions](https://learn.microsoft.com/en-us/windows/terminal/customize-settings/actions)。
 
 ### 一般情况一：增加平台专属环境变量
 
@@ -258,7 +336,24 @@ dotfiles sync -m "tool: add shared configuration"
 ```
 
 manifest 只放可公开的普通文件。凭据、设备绝对路径以及运行时生成内容不能作为源文件
-加入仓库。
+加入仓库。不要把 `.bashrc`、`.bash_profile`、`.profile`、`.zshrc` 或 `.zprofile`
+加入 manifest；安装器为它们维护本机 wrapper，否则第三方安装器会再次沿链接污染
+共享源文件。
+
+### 特殊情况：第三方安装器修改 `.bashrc/.zshrc`
+
+新安装后属于正常情况：安装器追加到本机 wrapper，`dotfiles status` 不把它视为
+漂移，`save/sync` 也不会收集或提交它。可以用以下命令确认边界：
+
+```bash
+ls -l ~/.bashrc ~/.zshrc                    # 应为普通文件，不应是符号链接
+head -n 1 ~/.bashrc ~/.zshrc                # 应含 dotfiles-local-wrapper 标记
+git -C "$(dotfiles root)" status --short     # 安装器修改后仓库应保持干净
+```
+
+手写的设备专属设置应放入 `local.bash`、`local.zsh` 或 `local.profile`，不要直接
+写入仓库共享配置。NVM 的标准初始化块通常不必手写，因为共享配置会自动发现 NVM；
+Miniconda 则应使用 `dotfiles config set conda-root <实际路径>`。
 
 ### 特殊情况：WSL 使用 Windows OpenSSH Agent
 
@@ -413,7 +508,7 @@ git push -u origin main
 
 1. 检查工作区和 upstream，并在修改本地文件前执行 `git fetch`；
 2. 快照仓库托管范围、HOME 托管文件、生成状态、复制模式基线，以及安装可能
-   创建或修改的目录状态和权限；
+   创建或修改的目录状态和权限；本机 Shell wrapper 也包含在状态快照和指纹中；
 3. 收集 HOME 副本、限定暂存范围、扫描常见私钥/token，然后创建 commit；
 4. 在已 fetch 的 upstream 上执行 rebase；
 5. 先部署并验证本机配置；
@@ -454,8 +549,8 @@ dotfiles recover
 `recover` 会先查询远端：若远端包含该 commit，就保留当前本地状态并清理快照；
 否则只有在整个受管面仍匹配事务指纹时才恢复事务前状态。之后对 Git、HOME、生成
 文件、复制基线或相关目录的修改都会让破坏性回退安全停止。Git hook 或远端服务
-触发的外部副作用不属于本地事务，无法由此工具撤销。新版工具会阻止产生多个待恢复
-事务；处理旧版本遗留的多个快照时，必须明确指定输出过的路径：
+触发的外部副作用不属于本地事务，无法由此工具撤销。工具会阻止产生多个待恢复事务。
+除直接执行 `dotfiles recover` 外，也可以显式指定命令输出的事务目录：
 
 ```bash
 dotfiles recover ~/.local/state/dotfiles/transactions/<事务目录>
@@ -479,10 +574,10 @@ git push
 ```
 
 其他设备执行 `dotfiles update`。该命令先 fetch，再把 fast-forward 与本机安装放在
-同一个本地事务中；安装失败会同时恢复原 HEAD、HOME 和设备状态。仓库存在未提交
-修改时会在事务开始前停止。fetch 更新的远端跟踪引用以及远端本身不属于本地回退
-范围。首次迁移已有 HOME 时，先运行 `--dry-run`；安装器产生备份后，应确认新环境
-正常，再自行归档或删除旧备份。
+同一个本地事务中；fast-forward 后由获取到的管理脚本接管部署。安装失败会同时恢复
+原 HEAD、HOME 和设备状态。仓库存在未提交修改时会在事务开始前停止。fetch 更新的
+远端跟踪引用以及远端本身不属于本地回退范围。首次安装到已有 HOME 时，先运行
+`--dry-run`；安装器产生备份后，应确认新环境正常，再自行归档或删除备份。
 
 ## 扩展配置
 
@@ -499,6 +594,7 @@ macos,linux|dotfiles/tool/unix.conf|.toolrc
 运行 `dotfiles install` 和 `dotfiles status`。平台公共环境写入
 `profiles/<platform>/env.sh`，交互函数/别名写入 `shell.sh`。主机级公共设置可建
 `profiles/hosts/<短主机名>/shell.sh`；敏感设置仍应放在 HOME 的本地覆盖文件。
+Shell 入口 wrapper 是刻意排除在 manifest 之外的特殊文件。
 
 本项目有意不自动安装系统软件或 Vim 插件。包名、管理员权限和公司策略高度依赖
 设备，把“配置同步”与“软件安装”分开可以让安装过程可预测，也更容易审计。
@@ -508,7 +604,9 @@ macos,linux|dotfiles/tool/unix.conf|.toolrc
 测试完全使用临时 HOME 和临时 bare Git remote，不接触真实用户配置。覆盖内容包括
 成功同步、push 拒绝回退、rebase 冲突回退、`SIGKILL` 后的 `ACTIVE` 恢复与修改
 保护、远端结果不确定后的 `recover` 与事务阻塞、`update` 部署失败后的 HEAD/HOME/
-目录权限回退、悬空链接、双边复制冲突和机密拦截：
+目录权限回退、更新后管理脚本接管部署、直接安装失败回退、设备配置双文件写入失败
+回退、事务范围外修改保护、Shell wrapper 与本机追加隔离、复制模式基线处理、
+NVM 自动发现、跨 Shell 历史重载、悬空链接、双边复制冲突和机密拦截：
 
 ```bash
 bash -n bin/dotfiles tests/test.sh

@@ -1,0 +1,16 @@
+# dotfiles-local-wrapper:v1:bash-profile
+# This entry point stays local so third-party installers can safely edit it.
+dotfiles_wrapper_generated=${XDG_CONFIG_HOME:-"$HOME/.config"}/dotfiles/generated.sh
+if [ -r "$dotfiles_wrapper_generated" ]; then
+    # shellcheck disable=SC1090
+    . "$dotfiles_wrapper_generated"
+fi
+unset dotfiles_wrapper_generated
+
+if [ -n "${DOTFILES_ROOT:-}" ] && [ -r "$DOTFILES_ROOT/dotfiles/bash/bash_profile" ]; then
+    # shellcheck disable=SC1090
+    . "$DOTFILES_ROOT/dotfiles/bash/bash_profile"
+else
+    printf 'warning: dotfiles Bash login configuration was not found; run dotfiles install\n' >&2
+fi
+# dotfiles-local-wrapper-end:v1:bash-profile

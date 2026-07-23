@@ -15,7 +15,27 @@ setopt INTERACTIVE_COMMENTS NO_BEEP
 setopt HIST_IGNORE_DUPS HIST_IGNORE_SPACE HIST_REDUCE_BLANKS
 setopt INC_APPEND_HISTORY SHARE_HISTORY EXTENDED_HISTORY
 
-HISTFILE=${XDG_STATE_HOME:-"$HOME/.local/state"}/zsh/history
+dotfiles_zsh_state=${XDG_STATE_HOME:-"$HOME/.local/state"}/zsh
+dotfiles_zsh_history=$dotfiles_zsh_state/history
+dotfiles_zsh_legacy_history=$HOME/.zsh_history
+if mkdir -p "$dotfiles_zsh_state" 2>/dev/null; then
+    chmod 700 "$dotfiles_zsh_state" 2>/dev/null || true
+    if [[ ! -e "$dotfiles_zsh_history" ]]; then
+        if [[ -f "$dotfiles_zsh_legacy_history" ]]; then
+            cp -p "$dotfiles_zsh_legacy_history" "$dotfiles_zsh_history" 2>/dev/null || true
+        else
+            : > "$dotfiles_zsh_history" 2>/dev/null || true
+        fi
+    fi
+fi
+if [[ -f "$dotfiles_zsh_history" && -w "$dotfiles_zsh_history" ]]; then
+    HISTFILE=$dotfiles_zsh_history
+    chmod 600 "$HISTFILE" 2>/dev/null || true
+else
+    HISTFILE=$dotfiles_zsh_legacy_history
+    print -u2 "warning: cannot use XDG Zsh history; falling back to $HISTFILE"
+fi
+unset dotfiles_zsh_state dotfiles_zsh_history dotfiles_zsh_legacy_history
 HISTSIZE=50000
 SAVEHIST=50000
 
@@ -55,3 +75,7 @@ fi
 dotfiles_local_zsh=${XDG_CONFIG_HOME:-"$HOME/.config"}/dotfiles/local.zsh
 [[ -r "$dotfiles_local_zsh" ]] && source "$dotfiles_local_zsh"
 unset dotfiles_local_zsh
+
+if (( $+functions[dotfiles_load_nvm] )); then
+    dotfiles_load_nvm
+fi
